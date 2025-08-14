@@ -1,0 +1,51 @@
+# --- Ignorar TODO Unity salvo Assets/Scripts ---
+UnityClient/*
+!UnityClient/Assets/
+UnityClient/Assets/*
+!UnityClient/Assets/Scripts/
+!UnityClient/Assets/Scripts/**
+# Incluir meta de scripts (ya cubierto con **/*.meta si existen)
+!UnityClient/Assets/Scripts/**/*.meta
+
+# (Resto del repo)
+.vscode/
+*.csproj.user
+*.suo
+*.user
+*.userprefs
+*.vs/
+[Dd]esktop.ini
+[Tt]humbs.db
+
+# Backend C#
+GameServer/bin/
+GameServer/obj/
+Backend/bin/
+Backend/obj/
+
+# Node
+**/node_modules/
+**/dist/
+
+# Logs
+*.log
+logs/
+log/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Docker
+**/Dockerfile.*
+docker-compose.override.yml
+.docker/
+
+# Temp / coverage
+tmp/
+temp/
+*.tmp
+coverage/
+*.trx
+TestResults/

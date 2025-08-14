@@ -1,0 +1,7 @@
+services:
+  backend:
+    build: .
+    container_name: mmo-backend
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
