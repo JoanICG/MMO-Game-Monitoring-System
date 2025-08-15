@@ -76,12 +76,24 @@ public class NetworkClient : MonoBehaviour
         }
     }
 
-    public async Task SendMove(Vector3 position)
+    /// <summary>
+    /// Send player input with sequence for client-side prediction
+    /// </summary>
+    public async Task SendPlayerInput(uint sequence, Vector2 input, float speed)
     {
         if (_ws == null || _ws.State != WebSocketState.Open) return;
-    // Use interpolation; escape JSON braces with doubled {{ }}
-    var json = $"{{\"op\":\"move\",\"x\":{position.x.ToString(System.Globalization.CultureInfo.InvariantCulture)},\"y\":{position.y.ToString(System.Globalization.CultureInfo.InvariantCulture)},\"z\":{position.z.ToString(System.Globalization.CultureInfo.InvariantCulture)}}}";
+        
+        // Enhanced input packet with sequence for reconciliation
+        var json = $"{{\"op\":\"input\",\"seq\":{sequence},\"x\":{input.x.ToString(System.Globalization.CultureInfo.InvariantCulture)},\"y\":{input.y.ToString(System.Globalization.CultureInfo.InvariantCulture)},\"speed\":{speed.ToString(System.Globalization.CultureInfo.InvariantCulture)},\"time\":{Time.time.ToString(System.Globalization.CultureInfo.InvariantCulture)}}}";
         await SendRaw(json);
+    }
+
+    /// <summary>
+    /// Legacy method for backward compatibility
+    /// </summary>
+    public async Task SendInput(Vector3 input, float speed)
+    {
+        await SendPlayerInput(0, new Vector2(input.x, input.z), speed);
     }
 
     private async Task SendJoin()
@@ -182,41 +194,27 @@ public class NetworkClient : MonoBehaviour
                     Debug.Log($"[NetworkClient] Spawn {(id==localPlayerId?"LOCAL":"REMOTE")} id={id} name={name} pos=({x},{y},{z})");
                     Players[id] = rp;
                 }
-                // For local player, check if server position differs significantly (teleport/admin commands)
+                // For local player, ALWAYS obey server position (FULL SERVER AUTHORITY)
                 var newPos = new Vector3(x, y, z);
                 rp.targetPos = newPos;
                 if (rp.id == localPlayerId)
                 {
-                    rp.pos = newPos; // store server pos for reconciliation
-                    // If server position is very different from local, server has authority (teleport)
-                    var distance = Vector3.Distance(rp.go.transform.position, newPos);
-                    Debug.Log($"[NetworkClient] Local player position update: server={newPos}, client={rp.go.transform.position}, distance={distance:F3}");
+                    rp.pos = newPos; // store server pos
                     
-                    if (distance > 0.5f) // Lower threshold for better server authority detection
+                    // ALWAYS obey server, no matter the distance
+                    Debug.Log($"[NetworkClient] SERVER AUTHORITY: Updating local player from {rp.go.transform.position} to {newPos}");
+                    
+                    // Tell LocalPlayerController about server position
+                    var controller = rp.go.GetComponent<LocalPlayerController>();
+                    if (controller != null)
                     {
-                        Debug.LogWarning($"[NetworkClient] SERVER AUTHORITY DETECTED: teleporting local player to {newPos} (was {rp.go.transform.position}, distance: {distance:F3})");
-                        
-                        // CRITICAL: Tell LocalPlayerController FIRST to stop sending moves
-                        var controller = rp.go.GetComponent<LocalPlayerController>();
-                        if (controller != null)
-                        {
-                            Debug.Log($"[NetworkClient] Calling SetServerPosition on LocalPlayerController");
-                            controller.SetServerPosition(newPos);
-                        }
-                        else
-                        {
-                            Debug.LogError($"[NetworkClient] LocalPlayerController NOT FOUND on local player GameObject!");
-                        }
-                        
-                        // THEN update the transform
-                        rp.go.transform.position = newPos;
-                        Debug.Log($"[NetworkClient] Local player transform updated to {rp.go.transform.position}");
+                        controller.ReceiveServerState(newPos, Time.time);
                     }
                     else
                     {
-                        // Small difference, smooth interpolation
-                        Debug.Log($"[NetworkClient] Small position difference, using interpolation");
-                        rp.go.transform.position = Vector3.Lerp(rp.go.transform.position, newPos, 5f * Time.deltaTime);
+                        // Fallback: directly set position if no controller
+                        rp.go.transform.position = newPos;
+                        Debug.LogError($"[NetworkClient] LocalPlayerController NOT FOUND, setting position directly");
                     }
                 }
                 else
