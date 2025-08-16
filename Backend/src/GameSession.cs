@@ -8,6 +8,7 @@ namespace Backend;
 public class GameSession : IDisposable
 {
     private readonly ConcurrentDictionary<Guid, (PlayerState state, WebSocket socket)> _players = new();
+    private readonly ConcurrentDictionary<Guid, PlayerSession> _playerSessions = new();
     private readonly JsonSerializerOptions _json = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
     private readonly object _broadcastLock = new object();
     private DateTime _lastBroadcast = DateTime.MinValue;
@@ -25,6 +26,107 @@ public class GameSession : IDisposable
         Console.WriteLine("[GameSession] Game loop timer started (bot updates every 100ms)");
     }
 
+    // Add UDP message handler
+    public async Task HandleUdpMessage(PlayerSession session, JsonDocument doc, UdpGameServer server)
+    {
+        if (!doc.RootElement.TryGetProperty("op", out var opProp)) return;
+        var op = opProp.GetString();
+
+        switch (op)
+        {
+            case "join":
+                await HandleUdpJoin(session, doc, server);
+                break;
+            case "input":
+                await HandleUdpInput(session, doc, server);
+                break;
+            case "heartbeat":
+                session.LastHeartbeat = DateTime.UtcNow;
+                break;
+        }
+    }
+
+    private async Task HandleUdpJoin(PlayerSession session, JsonDocument doc, UdpGameServer server)
+    {
+        var name = doc.RootElement.TryGetProperty("name", out var nameProp) ? 
+                   nameProp.GetString() ?? "Player" : "Player";
+        
+        var player = new PlayerState { Name = name[..Math.Min(name.Length, 16)] };
+        session.PlayerId = player.Id;
+        
+        _players[player.Id] = (player, null!); // null for WebSocket (not used in UDP)
+        _playerSessions[player.Id] = session;
+        
+        Console.WriteLine($"[GameSession] UDP JOIN id={player.Id} name={player.Name} endpoint={session.EndPoint}");
+        
+        // Send join acknowledgment
+        await server.SendToClient(session.EndPoint, new JoinAck("join_ack", player.Id));
+    }
+
+    private async Task HandleUdpInput(PlayerSession session, JsonDocument doc, UdpGameServer server)
+    {
+        if (!_players.TryGetValue(session.PlayerId, out var playerData)) return;
+        var player = playerData.state;
+
+        // Extract sequence number for duplicate detection
+        var sequence = doc.RootElement.TryGetProperty("seq", out var seqP) ? seqP.GetUInt32() : 0;
+        
+        // Skip if this is an old packet (simple duplicate detection)
+        if (sequence <= session.LastSequenceReceived) return;
+        session.LastSequenceReceived = sequence;
+
+        // Extract input data
+        var inputX = doc.RootElement.TryGetProperty("x", out var ixP) ? ixP.GetSingle() : 0f;
+        var inputY = doc.RootElement.TryGetProperty("y", out var iyP) ? iyP.GetSingle() : 0f;
+        var speed = doc.RootElement.TryGetProperty("speed", out var speedP) ? speedP.GetSingle() : 5f;
+
+        // Server authority check
+        if (player.ServerAuthorityUntil.HasValue && DateTime.UtcNow < player.ServerAuthorityUntil.Value)
+        {
+            Console.WriteLine($"[GameSession] UDP INPUT IGNORED (SERVER AUTHORITY) id={player.Id}");
+            return;
+        }
+
+        // Apply server-side movement
+        var deltaTime = 0.05f; // 20Hz server tick
+        var inputMagnitude = Math.Sqrt(inputX * inputX + inputY * inputY);
+        if (inputMagnitude > 1f)
+        {
+            inputX /= (float)inputMagnitude;
+            inputY /= (float)inputMagnitude;
+        }
+
+        var deltaX = inputX * speed * deltaTime;
+        var deltaZ = inputY * speed * deltaTime;
+
+        player.X += deltaX;
+        player.Z += deltaZ;
+        player.LastUpdate = DateTime.UtcNow;
+
+        Console.WriteLine($"[GameSession] UDP INPUT seq={sequence} id={player.Id} pos=({player.X:F2},{player.Y:F2},{player.Z:F2})");
+    }
+
+    public async Task BroadcastStateUdp(UdpGameServer server)
+    {
+        lock (_broadcastLock)
+        {
+            var now = DateTime.UtcNow;
+            if ((now - _lastBroadcast).TotalMilliseconds < BROADCAST_THROTTLE_MS)
+            {
+                return;
+            }
+            _lastBroadcast = now;
+        }
+
+        UpdateBots();
+
+        var playerDtos = _players.Values.Select(p => new PlayerDto(
+            p.state.Id, p.state.Name, p.state.X, p.state.Y, p.state.Z, p.state.IsNPC));
+
+        var snap = new StateSnapshot("state", playerDtos, GetBenchmarkMetrics());
+        await server.BroadcastToAll(snap);
+    }
+
     private void GameLoopTick(object? state)
     {
         if (_disposed) return;
@@ -34,26 +136,60 @@ public class GameSession : IDisposable
             var botsToUpdate = _players.Values.Where(p => p.state.IsBot && p.state.BotBehavior != BotBehavior.Idle).ToList();
             if (botsToUpdate.Count > 0)
             {
+                // Performance optimization: limit concurrent bot updates for large counts
+                const int MAX_BOTS_PER_UPDATE = 200;
+                var botsThisUpdate = botsToUpdate.Count > MAX_BOTS_PER_UPDATE ? 
+                    botsToUpdate.Take(MAX_BOTS_PER_UPDATE).ToList() : 
+                    botsToUpdate;
+                
                 bool anyBotMoved = false;
-                foreach (var (botState, socket) in botsToUpdate)
+                int updatedCount = 0;
+                
+                foreach (var (botState, socket) in botsThisUpdate)
                 {
                     var oldX = botState.X;
                     var oldZ = botState.Z;
                     
-                    UpdateBotBehavior(botState);
-                    
-                    // Check if bot actually moved
-                    if (Math.Abs(oldX - botState.X) > 0.001f || Math.Abs(oldZ - botState.Z) > 0.001f)
+                    try
                     {
-                        anyBotMoved = true;
-                        Console.WriteLine($"[GameSession] BOT MOVED id={botState.Id} from=({oldX:F2},{oldZ:F2}) to=({botState.X:F2},{botState.Z:F2}) behavior={botState.BotBehavior}");
+                        UpdateBotBehavior(botState);
+                        updatedCount++;
+                        
+                        // Check if bot actually moved (reduced logging for performance)
+                        if (Math.Abs(oldX - botState.X) > 0.001f || Math.Abs(oldZ - botState.Z) > 0.001f)
+                        {
+                            anyBotMoved = true;
+                            // Only log movement for debugging with smaller bot counts
+                            if (botsToUpdate.Count <= 50)
+                            {
+                                Console.WriteLine($"[GameSession] BOT MOVED id={botState.Id} from=({oldX:F2},{oldZ:F2}) to=({botState.X:F2},{botState.Z:F2}) behavior={botState.BotBehavior}");
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[GameSession] Bot update error for {botState.Id}: {ex.Message}");
+                        // Set bot to idle to prevent repeated errors
+                        botState.BotBehavior = BotBehavior.Idle;
                     }
                 }
                 
                 // Broadcast state if any bot moved
                 if (anyBotMoved)
                 {
-                    _ = Task.Run(async () => await BroadcastState());
+                    // Throttle broadcasts more aggressively with many bots
+                    var broadcastThrottle = botsToUpdate.Count > 100 ? 200 : BROADCAST_THROTTLE_MS;
+                    
+                    if ((DateTime.UtcNow - _lastBroadcast).TotalMilliseconds >= broadcastThrottle)
+                    {
+                        _ = Task.Run(async () => await BroadcastState());
+                    }
+                }
+                
+                // Log performance info for large bot counts
+                if (botsToUpdate.Count > 100)
+                {
+                    Console.WriteLine($"[GameSession] Bot Update: {updatedCount}/{botsToUpdate.Count} bots processed (limited for performance)");
                 }
             }
         }
@@ -201,6 +337,14 @@ public class GameSession : IDisposable
                     case "admin_bot_behavior":
                         if (me == null || !me.IsAdmin) break;
                         await HandleAdminBotBehavior(doc);
+                        break;
+                    case "admin_spawn_benchmark_bots":
+                        if (me == null || !me.IsAdmin) break;
+                        await HandleAdminSpawnBenchmarkBots(doc);
+                        break;
+                    case "admin_clear_benchmark_bots":
+                        if (me == null || !me.IsAdmin) break;
+                        await ClearBenchmarkBots();
                         break;
                 }
             }
@@ -354,16 +498,62 @@ public class GameSession : IDisposable
 
     private Task BroadcastState()
     {
+        const int MAX_ENTITIES_FOR_BROADCAST = 800;
+        
+        var playerDtos = _players.Values.Select(p => new PlayerDto(p.state.Id, p.state.Name, p.state.X, p.state.Y, p.state.Z, p.state.IsNPC));
+        
+        // Include benchmark metrics for admin clients
+        var benchmarkMetrics = GetBenchmarkMetrics();
+        
+        // Performance optimization: limit broadcast size for large entity counts
+        if (_players.Count > MAX_ENTITIES_FOR_BROADCAST)
+        {
+            Console.WriteLine($"[GameSession] WARNING: Large entity count ({_players.Count}), limiting broadcast to real players only");
+            playerDtos = _players.Values
+                .Where(p => !p.state.IsBot || p.state.Name.StartsWith("Player")) // Only real players and named entities
+                .Select(p => new PlayerDto(p.state.Id, p.state.Name, p.state.X, p.state.Y, p.state.Z, p.state.IsNPC))
+                .Take(100); // Limit to 100 entities in broadcast
+        }
+        
         var snap = new StateSnapshot(
             "state",
-            _players.Values.Select(p => new PlayerDto(p.state.Id, p.state.Name, p.state.X, p.state.Y, p.state.Z, p.state.IsNPC))
+            playerDtos,
+            benchmarkMetrics
         );
+        
         var json = JsonSerializer.Serialize(snap, _json);
         var bytes = Encoding.UTF8.GetBytes(json);
-        Console.WriteLine($"[GameSession] BROADCAST players={_players.Count}");
-        var tasks = _players.Values
+        
+        // Check broadcast size
+        var broadcastSizeKB = bytes.Length / 1024.0;
+        if (broadcastSizeKB > 100) // 100KB threshold
+        {
+            Console.WriteLine($"[GameSession] WARNING: Large broadcast size ({broadcastSizeKB:F1}KB) - may cause performance issues");
+        }
+        
+        Console.WriteLine($"[GameSession] BROADCAST players={_players.Count} bots={benchmarkMetrics.TotalBots} memory={benchmarkMetrics.MemoryUsageMB}MB size={broadcastSizeKB:F1}KB");
+        
+        var activeSockets = _players.Values
             .Where(v => v.socket != null && v.socket.State == WebSocketState.Open)
-            .Select(v => v.socket.SendAsync(bytes, WebSocketMessageType.Text, true, CancellationToken.None));
+            .ToList();
+            
+        if (activeSockets.Count == 0)
+        {
+            return Task.CompletedTask;
+        }
+        
+        var tasks = activeSockets.Select(async v =>
+        {
+            try
+            {
+                await v.socket.SendAsync(bytes, WebSocketMessageType.Text, true, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[GameSession] Broadcast failed to client: {ex.Message}");
+            }
+        });
+        
         return Task.WhenAll(tasks);
     }
 
@@ -553,4 +743,207 @@ public class GameSession : IDisposable
             _ => BotBehavior.Idle
         };
     }
+
+    private async Task HandleAdminSpawnBenchmarkBots(JsonDocument doc)
+    {
+        var count = doc.RootElement.TryGetProperty("count", out var countProp) ? countProp.GetInt32() : 100;
+        var behaviorStr = doc.RootElement.TryGetProperty("behavior", out var behaviorProp) ? behaviorProp.GetString() ?? "random" : "random";
+        var spreadRadius = doc.RootElement.TryGetProperty("spreadRadius", out var radiusProp) ? radiusProp.GetSingle() : 50f;
+        
+        var behavior = ParseBotBehavior(behaviorStr);
+        
+        Console.WriteLine($"[GameSession] ADMIN SPAWN BENCHMARK BOTS count={count} behavior={behavior} spread={spreadRadius}");
+        await SpawnBenchmarkBots(count, behavior, spreadRadius);
+    }
+
+    // ============================================
+    // BENCHMARK & STRESS TESTING FUNCTIONS
+    // ============================================
+
+    /// <summary>
+    /// Spawn multiple bots for server performance testing
+    /// </summary>
+    public async Task SpawnBenchmarkBots(int count = 100, BotBehavior behavior = BotBehavior.Random, float spreadRadius = 50f)
+    {
+        // Safety limits to prevent crashes
+        const int MAX_BOTS = 500;
+        const int CRITICAL_ENTITY_COUNT = 800;
+        
+        if (count > MAX_BOTS)
+        {
+            Console.WriteLine($"[BENCHMARK] ERROR: Requested {count} bots exceeds safety limit of {MAX_BOTS}");
+            count = MAX_BOTS;
+        }
+        
+        var currentEntities = _players.Count;
+        if (currentEntities + count > CRITICAL_ENTITY_COUNT)
+        {
+            var safeCount = Math.Max(0, CRITICAL_ENTITY_COUNT - currentEntities);
+            Console.WriteLine($"[BENCHMARK] WARNING: Reducing bot count from {count} to {safeCount} to prevent server overload");
+            count = safeCount;
+        }
+        
+        if (count <= 0)
+        {
+            Console.WriteLine($"[BENCHMARK] ERROR: Cannot spawn bots - server already at capacity ({currentEntities} entities)");
+            return;
+        }
+        
+        var startTime = DateTime.UtcNow;
+        Console.WriteLine($"[BENCHMARK] Starting bot spawn: {count} bots with {behavior} behavior (safety limited)");
+        
+        var spawnedIds = new List<Guid>();
+        var batchSize = Math.Min(5, count / 10); // Smaller batches for large counts
+        
+        for (int i = 0; i < count; i += batchSize)
+        {
+            var batchEnd = Math.Min(i + batchSize, count);
+            
+            for (int j = i; j < batchEnd; j++)
+            {
+                var botId = Guid.NewGuid();
+                
+                // Random position within spread radius
+                var angle = _random.NextDouble() * Math.PI * 2;
+                var distance = _random.NextDouble() * spreadRadius;
+                var x = (float)(Math.Cos(angle) * distance);
+                var z = (float)(Math.Sin(angle) * distance);
+                
+                var botState = new PlayerState
+                {
+                    Id = botId,
+                    Name = $"BenchBot_{j:D3}",
+                    X = x,
+                    Y = 0,
+                    Z = z,
+                    IsBot = true,
+                    BotBehavior = behavior,
+                    BotMoveDirection = new Vector3(0, 0, 0),
+                    BotSpeed = _random.Next(2, 6), // Random speed 2-5
+                    LastUpdate = DateTime.UtcNow
+                };
+                
+                // Add random movement target for moving bots
+                if (behavior == BotBehavior.Random)
+                {
+                    botState.BotMoveDirection = new Vector3(
+                        (float)(_random.NextDouble() - 0.5) * 2,
+                        0,
+                        (float)(_random.NextDouble() - 0.5) * 2
+                    );
+                }
+                else if (behavior == BotBehavior.Patrol)
+                {
+                    // Set up patrol waypoints
+                    botState.PatrolWaypoints = new List<Vector3>
+                    {
+                        new Vector3(x - 5, 0, z - 5),
+                        new Vector3(x + 5, 0, z - 5),
+                        new Vector3(x + 5, 0, z + 5),
+                        new Vector3(x - 5, 0, z + 5)
+                    };
+                    botState.CurrentWaypointIndex = 0;
+                }
+                
+                _players.TryAdd(botId, (botState, null!)); // null socket for bots
+                spawnedIds.Add(botId);
+            }
+            
+            // Longer delay between batches for large counts to prevent overload
+            if (i + batchSize < count)
+            {
+                var delay = count > 200 ? 100 : 50; // Slower spawning for large counts
+                await Task.Delay(delay);
+            }
+        }
+        
+        var duration = DateTime.UtcNow - startTime;
+        Console.WriteLine($"[BENCHMARK] Spawned {spawnedIds.Count} bots in {duration.TotalMilliseconds:F2}ms");
+        Console.WriteLine($"[BENCHMARK] Total entities: {_players.Count} (Active bots: {_players.Count(p => p.Value.state.IsBot && p.Value.state.BotBehavior != BotBehavior.Idle)})");
+        
+        // Only broadcast if entity count is reasonable
+        if (_players.Count <= CRITICAL_ENTITY_COUNT)
+        {
+            await BroadcastState();
+        }
+        else
+        {
+            Console.WriteLine($"[BENCHMARK] WARNING: Skipping broadcast - too many entities ({_players.Count})");
+        }
+        
+        // Log performance metrics
+        LogBenchmarkMetrics(spawnedIds.Count);
+    }
+
+    /// <summary>
+    /// Remove all benchmark bots
+    /// </summary>
+    public async Task ClearBenchmarkBots()
+    {
+        var startTime = DateTime.UtcNow;
+        var botIds = _players.Where(p => p.Value.state.IsBot && p.Value.state.Name.StartsWith("BenchBot_"))
+                            .Select(p => p.Key)
+                            .ToList();
+        
+        Console.WriteLine($"[BENCHMARK] Removing {botIds.Count} benchmark bots...");
+        
+        foreach (var botId in botIds)
+        {
+            _players.TryRemove(botId, out _);
+        }
+        
+        var duration = DateTime.UtcNow - startTime;
+        Console.WriteLine($"[BENCHMARK] Removed {botIds.Count} bots in {duration.TotalMilliseconds:F2}ms");
+        Console.WriteLine($"[BENCHMARK] Remaining entities: {_players.Count}");
+        
+        await BroadcastState();
+    }
+
+    /// <summary>
+    /// Get current server performance metrics
+    /// </summary>
+    public ServerBenchmarkMetrics GetBenchmarkMetrics()
+    {
+        var totalPlayers = _players.Count;
+        var realPlayers = _players.Count(p => !p.Value.state.IsBot);
+        var totalBots = _players.Count(p => p.Value.state.IsBot);
+        var activeBots = _players.Count(p => p.Value.state.IsBot && p.Value.state.BotBehavior != BotBehavior.Idle);
+        
+        return new ServerBenchmarkMetrics
+        {
+            TotalEntities = totalPlayers,
+            RealPlayers = realPlayers,
+            TotalBots = totalBots,
+            ActiveBots = activeBots,
+            UpdatesPerSecond = 1000 / BOT_UPDATE_MS, // Theoretical max
+            MemoryUsageMB = GC.GetTotalMemory(false) / 1024 / 1024,
+            UptimeSeconds = (DateTime.UtcNow - (_gameLoopStartTime ?? DateTime.UtcNow)).TotalSeconds
+        };
+    }
+
+    private DateTime? _gameLoopStartTime = DateTime.UtcNow;
+
+    private void LogBenchmarkMetrics(int newBots)
+    {
+        var metrics = GetBenchmarkMetrics();
+        Console.WriteLine($"[BENCHMARK METRICS]");
+        Console.WriteLine($"  Total Entities: {metrics.TotalEntities}");
+        Console.WriteLine($"  Real Players: {metrics.RealPlayers}");
+        Console.WriteLine($"  Total Bots: {metrics.TotalBots}");
+        Console.WriteLine($"  Active Bots: {metrics.ActiveBots}");
+        Console.WriteLine($"  Memory Usage: {metrics.MemoryUsageMB:F2} MB");
+        Console.WriteLine($"  Bot Update Rate: {metrics.UpdatesPerSecond} Hz");
+        Console.WriteLine($"  Uptime: {metrics.UptimeSeconds:F2} seconds");
+    }
+}
+
+public class ServerBenchmarkMetrics
+{
+    public int TotalEntities { get; set; }
+    public int RealPlayers { get; set; }
+    public int TotalBots { get; set; }
+    public int ActiveBots { get; set; }
+    public double UpdatesPerSecond { get; set; }
+    public long MemoryUsageMB { get; set; }
+    public double UptimeSeconds { get; set; }
 }

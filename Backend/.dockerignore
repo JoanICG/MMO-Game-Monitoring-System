@@ -1,0 +1,11 @@
+bin/
+obj/
+.vs/
+.vscode/
+*.user
+*.suo
+.dockerignore
+Dockerfile
+docker-compose.yml
+README.md
+*.md

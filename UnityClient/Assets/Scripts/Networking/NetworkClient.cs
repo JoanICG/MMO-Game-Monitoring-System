@@ -185,24 +185,31 @@ public class NetworkClient : MonoBehaviour
                     {
                         var r = rp.go.GetComponent<Renderer>();
                         if (r) r.material.color = Color.green;
+                        
                         // Auto-attach controller if not present so WASD moves the spawned capsule
                         if (rp.go.GetComponent<LocalPlayerController>() == null)
                         {
                             rp.go.AddComponent<LocalPlayerController>();
                         }
+                        
+                        // Auto-attach movement tester for debugging
+                        if (rp.go.GetComponent<MovementTester>() == null)
+                        {
+                            var tester = rp.go.AddComponent<MovementTester>();
+                            Debug.Log("[NetworkClient] MovementTester attached to local player - Press R to toggle reconciliation, T to test teleport");
+                        }
                     }
                     Debug.Log($"[NetworkClient] Spawn {(id==localPlayerId?"LOCAL":"REMOTE")} id={id} name={name} pos=({x},{y},{z})");
                     Players[id] = rp;
                 }
-                // For local player, ALWAYS obey server position (FULL SERVER AUTHORITY)
+                // Update position data
                 var newPos = new Vector3(x, y, z);
                 rp.targetPos = newPos;
+                
+                // For local player, handle based on reconciliation settings
                 if (rp.id == localPlayerId)
                 {
                     rp.pos = newPos; // store server pos
-                    
-                    // ALWAYS obey server, no matter the distance
-                    Debug.Log($"[NetworkClient] SERVER AUTHORITY: Updating local player from {rp.go.transform.position} to {newPos}");
                     
                     // Tell LocalPlayerController about server position
                     var controller = rp.go.GetComponent<LocalPlayerController>();
@@ -213,8 +220,8 @@ public class NetworkClient : MonoBehaviour
                     else
                     {
                         // Fallback: directly set position if no controller
+                        Debug.LogWarning($"[NetworkClient] LocalPlayerController NOT FOUND, setting position directly");
                         rp.go.transform.position = newPos;
-                        Debug.LogError($"[NetworkClient] LocalPlayerController NOT FOUND, setting position directly");
                     }
                 }
                 else

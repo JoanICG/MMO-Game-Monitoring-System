@@ -12,16 +12,25 @@ public class LocalPlayerController : MonoBehaviour
     
     [Header("Network")]
     public float inputSendRate = 20f; // 20Hz for production
+    public bool enableServerReconciliation = false; // Disable for smoother movement
+    public float reconciliationSmoothTime = 0.2f; // Smooth correction when enabled
+    public float maxErrorBeforeSnap = 2f; // Distance that forces immediate snap
     
     [Header("Camera Integration")]
     public bool autoSetupCamera = true;
     
     private NetworkClient _net;
+    private MonoBehaviour _udpNet; // UDP client reference (UdpNetworkClient as MonoBehaviour)
     private float _lastInputSendTime;
     
     // Client-Side Prediction
     private Vector3 _velocity = Vector3.zero;
     private uint _inputSequence = 0;
+    
+    // Server reconciliation smoothing
+    private Vector3 _serverPosition;
+    private Vector3 _reconciliationVelocity;
+    private bool _hasServerPosition = false;
     
     // Input state
     private Vector2 _currentInput;
@@ -34,33 +43,66 @@ public class LocalPlayerController : MonoBehaviour
     // Camera reference (will be resolved at runtime)
     private object _cameraManager;
 
+    // Add method to set network client
+    public void SetNetworkClient(MonoBehaviour udpClient)
+    {
+        _udpNet = udpClient;
+    }
+
     /// <summary>
     /// Server reconciliation - called by NetworkClient
     /// </summary>
     public void ReceiveServerState(Vector3 serverPos, float serverTime)
     {
+        if (!enableServerReconciliation)
+        {
+            // Pure client-side prediction: ignore server corrections for smoother movement
+            Debug.Log($"[LocalPlayer] Server reconciliation disabled. Client pos: {transform.position}, Server pos: {serverPos}");
+            return;
+        }
+        
         float positionError = Vector3.Distance(transform.position, serverPos);
         
-        if (positionError > 0.15f) // Error threshold for correction
+        // Store server position for smooth reconciliation
+        _serverPosition = serverPos;
+        _hasServerPosition = true;
+        
+        // Immediate snap for large errors (teleportation, major desync)
+        if (positionError > maxErrorBeforeSnap)
         {
-            Debug.LogWarning($"[Reconciliation] Correcting position error: {positionError:F3}m");
-            transform.position = Vector3.Lerp(transform.position, serverPos, 0.8f);
-            _velocity *= 0.5f; // Reduce velocity on correction
-            
-            // Metrics event for monitoring
-            LogMetrics("player.prediction.correction", positionError);
+            Debug.LogWarning($"[Reconciliation] Large error detected ({positionError:F2}m), snapping to server position");
+            transform.position = serverPos;
+            _velocity = Vector3.zero;
+            LogMetrics("player.prediction.snap", positionError);
+        }
+        else if (positionError > 0.05f) // Small errors get smooth correction
+        {
+            Debug.Log($"[Reconciliation] Small error detected ({positionError:F3}m), smooth correcting");
+            LogMetrics("player.prediction.smooth_correction", positionError);
         }
     }
 
     private void Start()
     {
+        // Try both network clients for backward compatibility
         _net = NetworkClient.Instance;
+        
+        // Try to find UDP client using component search
+        var udpClientObjs = FindObjectsByType<MonoBehaviour>(FindObjectsSortMode.None);
+        foreach (var obj in udpClientObjs)
+        {
+            if (obj.GetType().Name == "UdpNetworkClient")
+            {
+                _udpNet = obj;
+                break;
+            }
+        }
+        
         _lastMetricsTime = Time.time;
         
-        // Setup camera system
         SetupCameraSystem();
         
-        Debug.Log("[LocalPlayerController] Initialized with camera integration");
+        Debug.Log("[LocalPlayerController] Initialized with UDP and WebSocket support");
     }
     
     private void SetupCameraSystem()
@@ -134,6 +176,22 @@ public class LocalPlayerController : MonoBehaviour
         
         // Apply movement
         transform.position += _velocity * Time.deltaTime;
+        
+        // Apply smooth server reconciliation if enabled and needed
+        if (enableServerReconciliation && _hasServerPosition)
+        {
+            float errorDistance = Vector3.Distance(transform.position, _serverPosition);
+            if (errorDistance > 0.01f) // Only correct if there's meaningful error
+            {
+                Vector3 correctedPosition = Vector3.SmoothDamp(
+                    transform.position, 
+                    _serverPosition, 
+                    ref _reconciliationVelocity, 
+                    reconciliationSmoothTime
+                );
+                transform.position = correctedPosition;
+            }
+        }
     }
 
     private async void SendInputToServer()
@@ -146,13 +204,26 @@ public class LocalPlayerController : MonoBehaviour
         {
             _inputSequence++;
             
-            // Send optimized input packet
-            await _net.SendPlayerInput(_inputSequence, _currentInput, speed);
+            // Prefer UDP over WebSocket for better performance
+            if (_udpNet != null)
+            {
+                // Use reflection to call SendPlayerInput on UDP client
+                var method = _udpNet.GetType().GetMethod("SendPlayerInput");
+                if (method != null)
+                {
+                    var task = (Task)method.Invoke(_udpNet, new object[] { _inputSequence, _currentInput, speed });
+                    await task;
+                }
+            }
+            else if (_net != null)
+            {
+                await _net.SendPlayerInput(_inputSequence, _currentInput, speed);
+            }
+            
             _lastSentInput = _currentInput;
             _totalInputsSent++;
             
-            // Log for debugging
-            Debug.Log($"[Input] Seq: {_inputSequence}, Input: {_currentInput}, Vel: {_velocity.magnitude:F2}");
+            Debug.Log($"[Input] Seq: {_inputSequence}, Input: {_currentInput}, Protocol: {(_udpNet != null ? "UDP" : "WebSocket")}");
         }
     }
 

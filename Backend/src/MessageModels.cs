@@ -15,4 +15,4 @@ public record AdminKickAll(string Op);
 // Outgoing
 public record JoinAck(string Op, Guid Id);
 public record PlayerDto(Guid Id, string Name, float X, float Y, float Z, bool IsNPC = false);
-public record StateSnapshot(string Op, IEnumerable<PlayerDto> Players);
+public record StateSnapshot(string Op, IEnumerable<PlayerDto> Players, ServerBenchmarkMetrics? BenchmarkMetrics = null);

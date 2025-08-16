@@ -1,7 +1,11 @@
 FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
 WORKDIR /src
+
+# Copy csproj and restore as distinct layers (better Docker caching)
 COPY ./src/*.csproj ./
 RUN dotnet restore
+
+# Copy everything else and publish directly
 COPY ./src ./
 RUN dotnet publish -c Release -o /out --no-restore
 

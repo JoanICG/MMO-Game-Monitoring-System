@@ -7,8 +7,12 @@ app.UseWebSockets();
 app.UseStaticFiles(); // Para servir archivos estáticos
 
 var session = new GameSession();
+var udpServer = new UdpGameServer(8081); // UDP on port 8081
 
-app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
+// Start UDP server
+_ = Task.Run(() => udpServer.StartAsync());
+
+app.MapGet("/health", () => Results.Ok(new { status = "ok", websocket_port = 8080, udp_port = 8081 }));
 
 // Panel de administración
 app.MapGet("/admin", async ctx =>
@@ -17,7 +21,7 @@ app.MapGet("/admin", async ctx =>
     await ctx.Response.WriteAsync(GetAdminPanel());
 });
 
-// WebSocket para clientes normales
+// WebSocket for compatibility (clients should prefer UDP)
 app.Map("/ws", async ctx =>
 {
     if (!ctx.WebSockets.IsWebSocketRequest)
@@ -27,11 +31,11 @@ app.Map("/ws", async ctx =>
         return;
     }
     using var socket = await ctx.WebSockets.AcceptWebSocketAsync();
-    Console.WriteLine("[Program] WebSocket accepted /ws (client)");
+    Console.WriteLine("[Program] WebSocket accepted /ws (client) - Consider upgrading to UDP");
     await session.HandleAsync(socket, false); // false = not admin
 });
 
-// WebSocket para administradores
+// WebSocket for admin
 app.Map("/admin-ws", async ctx =>
 {
     if (!ctx.WebSockets.IsWebSocketRequest)
@@ -103,6 +107,26 @@ static string GetAdminPanel()
                 <button class="btn btn-info" onclick="randomizeAllBots()">🎲 Randomize All Bots</button>
                 <button class="btn btn-warning" onclick="stopAllBots()">⏹️ Stop All Bots</button>
                 <button class="btn btn-danger" onclick="removeAllBots()">🗑️ Remove All Bots</button>
+                
+                <h4>🚀 Benchmark / Stress Testing</h4>
+                <div style="background: #fff3cd; padding: 10px; margin: 10px 0; border-radius: 4px; border: 1px solid #ffeaa7;">
+                    <strong>⚠️ Warning:</strong> Benchmark mode spawns many bots for performance testing
+                </div>
+                <input type="number" id="benchmarkCount" class="input" placeholder="Bot Count" value="100" min="1" max="1000">
+                <select id="benchmarkBehavior" class="input">
+                    <option value="random">Random Movement</option>
+                    <option value="idle">Idle</option>
+                    <option value="patrol">Patrol</option>
+                </select>
+                <input type="number" id="benchmarkSpread" class="input" placeholder="Spread Radius" value="50" step="5">
+                <br>
+                <button class="btn btn-warning" onclick="spawnBenchmarkBots()">🚀 Spawn Benchmark Bots</button>
+                <button class="btn btn-danger" onclick="clearBenchmarkBots()">🧹 Clear Benchmark Bots</button>
+                
+                <div id="benchmarkMetrics" style="background: #e7f3ff; padding: 10px; margin: 10px 0; border-radius: 4px; border: 1px solid #007bff;">
+                    <strong>📊 Real-time Server Metrics:</strong>
+                    <div style="color: #666; margin-top: 5px;">Metrics will update automatically...</div>
+                </div>
             </div>
             
             <div class="section">
@@ -159,6 +183,11 @@ static string GetAdminPanel()
                         players[p.id] = p;
                     });
                     updatePlayerList();
+                    
+                    // Update benchmark metrics if available
+                    if (msg.benchmarkMetrics) {
+                        updateBenchmarkMetrics(msg.benchmarkMetrics);
+                    }
                 }
             };
         }
@@ -339,6 +368,141 @@ static string GetAdminPanel()
                     ws.send(JSON.stringify({op: 'admin_kick_all'}));
                     addLog('🚫 Kicking all players');
                 }
+            }
+        }
+
+        // Benchmark Functions
+        function spawnBenchmarkBots() {
+            const count = parseInt(document.getElementById('benchmarkCount').value) || 100;
+            const behavior = document.getElementById('benchmarkBehavior').value || 'random';
+            const spreadRadius = parseFloat(document.getElementById('benchmarkSpread').value) || 50;
+            
+            if (count > 500 && !confirm(`Are you sure you want to spawn ${count} bots? This may impact performance.`)) {
+                return;
+            }
+            
+            // Spawn bots directly like simple clients
+            for (let i = 0; i < count; i++) {
+                setTimeout(() => {
+                    spawnSimpleBot(`Bot${Date.now()}_${i}`, behavior, spreadRadius);
+                }, i * 50); // Stagger spawning to avoid overwhelming
+            }
+            addLog(`🚀 Spawning ${count} benchmark bots with ${behavior} behavior (spread: ${spreadRadius})`);
+        }
+
+        // Store bot connections to manage them
+        const botConnections = [];
+
+        function spawnSimpleBot(name, behavior, spreadRadius) {
+            // Create a new WebSocket connection for each bot
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const botWs = new WebSocket(`${protocol}//${window.location.host}/ws`);
+            
+            botWs.onopen = function() {
+                // Spawn the bot
+                const x = (Math.random() - 0.5) * spreadRadius * 2;
+                const z = (Math.random() - 0.5) * spreadRadius * 2;
+                
+                botWs.send(JSON.stringify({
+                    action: 'spawn_bot',
+                    botId: name,
+                    x: x,
+                    z: z,
+                    strategy: behavior
+                }));
+                
+                // Start bot behavior
+                if (behavior === 'random') {
+                    startRandomMovement(botWs);
+                } else if (behavior === 'patrol') {
+                    startPatrolMovement(botWs);
+                }
+                
+                // Store connection for cleanup
+                botConnections.push(botWs);
+            };
+            
+            botWs.onerror = function(error) {
+                console.log(`Bot ${name} WebSocket error:`, error);
+            };
+            
+            botWs.onclose = function() {
+                // Remove from connections array
+                const index = botConnections.indexOf(botWs);
+                if (index > -1) {
+                    botConnections.splice(index, 1);
+                }
+            };
+        }
+
+        function startRandomMovement(botWs) {
+            const moveInterval = setInterval(() => {
+                if (botWs.readyState === WebSocket.OPEN) {
+                    const x = (Math.random() - 0.5) * 20; // Random movement in 20x20 area
+                    const z = (Math.random() - 0.5) * 20;
+                    
+                    botWs.send(JSON.stringify({
+                        action: 'move',
+                        x: x,
+                        z: z
+                    }));
+                } else {
+                    clearInterval(moveInterval);
+                }
+            }, 1000 + Math.random() * 2000); // Move every 1-3 seconds
+        }
+
+        function startPatrolMovement(botWs) {
+            let patrolIndex = 0;
+            const patrolPoints = [
+                {x: -5, z: -5},
+                {x: 5, z: -5},
+                {x: 5, z: 5},
+                {x: -5, z: 5}
+            ];
+            
+            const patrolInterval = setInterval(() => {
+                if (botWs.readyState === WebSocket.OPEN) {
+                    const point = patrolPoints[patrolIndex % patrolPoints.length];
+                    patrolIndex++;
+                    
+                    botWs.send(JSON.stringify({
+                        action: 'move',
+                        x: point.x,
+                        z: point.z
+                    }));
+                } else {
+                    clearInterval(patrolInterval);
+                }
+            }, 3000); // Move every 3 seconds
+        }
+
+        function clearBenchmarkBots() {
+            if (confirm('Remove all benchmark bots?')) {
+                // Close all bot connections
+                botConnections.forEach(ws => {
+                    if (ws.readyState === WebSocket.OPEN) {
+                        ws.close();
+                    }
+                });
+                botConnections.length = 0; // Clear the array
+                addLog('🧹 Clearing all benchmark bots');
+            }
+        }
+
+        function updateBenchmarkMetrics(metrics) {
+            const metricsContainer = document.getElementById('benchmarkMetrics');
+            if (metricsContainer) {
+                metricsContainer.innerHTML = `
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px;">
+                        <div><strong>Total Entities:</strong> ${metrics.totalEntities}</div>
+                        <div><strong>Real Players:</strong> ${metrics.realPlayers}</div>
+                        <div><strong>Total Bots:</strong> ${metrics.totalBots}</div>
+                        <div><strong>Active Bots:</strong> ${metrics.activeBots}</div>
+                        <div><strong>Memory Usage:</strong> ${metrics.memoryUsageMB} MB</div>
+                        <div><strong>Update Rate:</strong> ${metrics.updatesPerSecond} Hz</div>
+                    </div>
+                `;
             }
         }
 
