@@ -9,7 +9,7 @@ namespace Backend;
 public class UdpGameServer : IDisposable
 {
     private readonly UdpClient _udpServer;
-    private readonly ConcurrentDictionary<IPEndPoint, PlayerSession> _clients = new();
+    public readonly ConcurrentDictionary<IPEndPoint, PlayerSession> _clients = new();
     private readonly GameSession _gameSession;
     private readonly JsonSerializerOptions _json = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
     private bool _running = false;
@@ -35,14 +35,17 @@ public class UdpGameServer : IDisposable
 
     private async Task ReceiveLoop()
     {
+        Console.WriteLine("[UdpGameServer] Receive loop started, waiting for UDP packets...");
         while (_running)
         {
             try
             {
+                Console.WriteLine("[UdpGameServer] Waiting for UDP packet...");
                 var result = await _udpServer.ReceiveAsync();
                 var endpoint = result.RemoteEndPoint;
                 var data = result.Buffer;
                 
+                Console.WriteLine($"[UdpGameServer] Received {data.Length} bytes from {endpoint}");
                 await HandleClientMessage(endpoint, data);
             }
             catch (Exception ex) when (_running)
@@ -56,7 +59,18 @@ public class UdpGameServer : IDisposable
     {
         try
         {
+            Console.WriteLine($"[UdpGameServer] Processing {data.Length} bytes from {endpoint}");
+            Console.WriteLine($"[UdpGameServer] Raw bytes: {string.Join(" ", data.Select(b => b.ToString("X2")))}");
+            
+            if (data.Length < 10)
+            {
+                Console.WriteLine($"[UdpGameServer] Packet too small ({data.Length} bytes), ignoring");
+                return;
+            }
+            
             var json = Encoding.UTF8.GetString(data);
+            Console.WriteLine($"[UdpGameServer] JSON: {json}");
+            
             using var doc = JsonDocument.Parse(json);
             
             if (!doc.RootElement.TryGetProperty("op", out var opProp)) return;

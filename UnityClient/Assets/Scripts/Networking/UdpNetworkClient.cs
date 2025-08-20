@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -7,14 +8,40 @@ using System.Threading;
 using System.Threading.Tasks;
 using UnityEngine;
 
+// Serializable message classes for JSON
+[Serializable]
+public class JoinMessage
+{
+    public string op = "join";
+    public string name;
+}
+
+[Serializable]
+public class MoveMessage
+{
+    public string op = "move";
+    public float x, y, z;
+    public float speed;
+    public float time;
+}
+
+[Serializable]
+public class HeartbeatMessage
+{
+    public string op = "heartbeat";
+    public float time;
+}
+
 public class UdpNetworkClient : MonoBehaviour
 {
     public static UdpNetworkClient Instance;
 
     [Header("Connection")]
-    public string serverHost = "localhost";
+    public string serverHost = "192.168.0.110";  // Server machine IP for network play
     public int serverPort = 8081;
     public string playerName = "Player";
+    [Tooltip("If checked, will try localhost first, then fall back to serverHost")]
+    public bool tryLocalFirst = true;
 
     [Header("Network Settings")]
     public int sendRate = 20; // Hz
@@ -47,16 +74,40 @@ public class UdpNetworkClient : MonoBehaviour
 
     private async void Awake()
     {
+        Debug.Log("[UdpNetworkClient] Awake called - Starting UDP client");
+        
         if (Instance != null && Instance != this)
         {
+            Debug.Log("[UdpNetworkClient] Instance already exists, destroying duplicate");
             Destroy(gameObject);
             return;
         }
         Instance = this;
         DontDestroyOnLoad(gameObject);
 
+        // Initialize object pool if using object pooling
+        /* Commented out for now - will implement later
+        if (useObjectPooling)
+        {
+            // Create object pool if it doesn't exist
+            if (GameObjectPool.Instance == null)
+            {
+                var poolObj = new GameObject("GameObjectPool");
+                DontDestroyOnLoad(poolObj);
+                objectPool = poolObj.AddComponent<GameObjectPool>();
+            }
+            else
+            {
+                objectPool = GameObjectPool.Instance;
+            }
+        }
+        */
+
+        Debug.Log($"[UdpNetworkClient] Instance set, autoJoin={autoJoin}");
+        
         if (autoJoin)
         {
+            Debug.Log("[UdpNetworkClient] Auto-joining server...");
             await ConnectAndJoin();
         }
     }
@@ -65,6 +116,7 @@ public class UdpNetworkClient : MonoBehaviour
     {
         try
         {
+            Debug.Log($"[UdpNetworkClient] Starting connection to {serverHost}:{serverPort}");
             _serverEndpoint = new IPEndPoint(IPAddress.Parse(GetServerIP()), serverPort);
             _udpClient = new UdpClient();
             _cts = new CancellationTokenSource();
@@ -77,6 +129,7 @@ public class UdpNetworkClient : MonoBehaviour
             // Send join message
             await SendJoin();
             _connected = true;
+            _lastHeartbeat = Time.time;
             
             Debug.Log("[UdpNetworkClient] Connected and join sent");
         }
@@ -88,7 +141,14 @@ public class UdpNetworkClient : MonoBehaviour
 
     private string GetServerIP()
     {
-        // Convert localhost to IP for UDP
+        // If tryLocalFirst is enabled and we're in editor/development, try localhost first
+        if (tryLocalFirst && Application.isEditor)
+        {
+            Debug.Log("[UdpNetworkClient] Editor mode: trying localhost first");
+            return "127.0.0.1";
+        }
+        
+        // Convert localhost to IP for UDP, otherwise use configured host
         if (serverHost == "localhost") return "127.0.0.1";
         return serverHost;
     }
@@ -133,13 +193,13 @@ public class UdpNetworkClient : MonoBehaviour
 
     private async Task SendJoin()
     {
-        var message = new { op = "join", name = playerName };
+        var message = new JoinMessage { name = playerName };
         await SendMessage(message);
     }
 
     private async Task SendHeartbeat()
     {
-        var message = new { op = "heartbeat", time = Time.time };
+        var message = new HeartbeatMessage { time = Time.time };
         await SendMessage(message);
     }
 
@@ -148,7 +208,9 @@ public class UdpNetworkClient : MonoBehaviour
         try
         {
             var json = JsonUtility.ToJson(message);
+            Debug.Log($"[UdpNetworkClient] Sending JSON: {json}");
             var data = Encoding.UTF8.GetBytes(json);
+            Debug.Log($"[UdpNetworkClient] Sending {data.Length} bytes to {_serverEndpoint}");
             
             if (data.Length > maxPacketSize)
             {
@@ -157,6 +219,7 @@ public class UdpNetworkClient : MonoBehaviour
             }
 
             await _udpClient.SendAsync(data, data.Length, _serverEndpoint);
+            Debug.Log("[UdpNetworkClient] Message sent successfully");
         }
         catch (Exception ex)
         {
@@ -195,28 +258,63 @@ public class UdpNetworkClient : MonoBehaviour
     {
         try
         {
+            // Remove excessive debug logging for performance
+            // Debug.Log($"[UdpNetworkClient] Full JSON received: {json}");
+            
             // Simple JSON parsing for state updates
             var playersIndex = json.IndexOf("\"players\":[");
-            if (playersIndex < 0) return;
+            if (playersIndex < 0) 
+            {
+                Debug.LogWarning("[UdpNetworkClient] No 'players' array found in JSON");
+                return;
+            }
 
             var arrayPart = json.Substring(playersIndex + 11);
             arrayPart = arrayPart.TrimEnd('}', '\n', '\r');
+            
+            // Only log occasionally for debugging
+            // Debug.Log($"[UdpNetworkClient] Players array part: {arrayPart}");
 
             var keep = new HashSet<Guid>();
             var playerChunks = arrayPart.Split(new[] { "},{" }, StringSplitOptions.RemoveEmptyEntries);
-
-            foreach (var chunk in playerChunks)
+            
+            // Log player count every 60 frames to monitor performance
+            if (Time.frameCount % 60 == 0)
             {
+                Debug.Log($"[UdpNetworkClient] Processing {playerChunks.Length} players at frame {Time.frameCount}");
+            }
+
+            for (int i = 0; i < playerChunks.Length; i++)
+            {
+                var chunk = playerChunks[i];
+                
+                // Only log first few chunks for debugging
+                if (i < 2 && Time.frameCount % 60 == 0) 
+                {
+                    Debug.Log($"[UdpNetworkClient] Processing chunk: {chunk}");
+                }
+                
                 var id = ExtractGuid(chunk, "\"id\":\"");
-                if (id == Guid.Empty) continue;
+                if (id == Guid.Empty) 
+                {
+                    if (i < 2) Debug.LogWarning($"[UdpNetworkClient] Could not extract ID from chunk: {chunk}");
+                    continue;
+                }
 
                 var name = ExtractString(chunk, "\"name\":\"");
                 var x = ExtractFloat(chunk, "\"x\":");
                 var y = ExtractFloat(chunk, "\"y\":");
                 var z = ExtractFloat(chunk, "\"z\":");
+                var isNPC = ExtractBool(chunk, "\"isNPC\":");
+
+                // Only log coordinates for debugging occasionally
+                if (i < 2 && Time.frameCount % 60 == 0)
+                {
+                    Debug.Log($"[UdpNetworkClient] Extracted - ID: {id}, Name: {name}, Pos: ({x},{y},{z}), IsNPC: {isNPC}");
+                }
 
                 keep.Add(id);
-                UpdateOrCreatePlayer(id, name, new Vector3(x, y, z));
+                UpdateOrCreatePlayer(id, name, new Vector3(x, y, z), isNPC);
             }
 
             // Remove disconnected players
@@ -237,11 +335,14 @@ public class UdpNetworkClient : MonoBehaviour
         }
     }
 
-    private void UpdateOrCreatePlayer(Guid id, string name, Vector3 position)
+    private void UpdateOrCreatePlayer(Guid id, string name, Vector3 position, bool isNPC = false)
     {
+        // Remove excessive logging for performance
+        // Debug.Log($"[UdpNetworkClient] UpdateOrCreatePlayer called - ID: {id}, Name: {name}, Position: {position}, IsNPC: {isNPC}, LocalID: {localPlayerId}");
+        
         if (!Players.TryGetValue(id, out var player))
         {
-            // Create new player
+            // Create new player - ONLY create GameObject once
             player = new RemotePlayer
             {
                 id = id,
@@ -250,33 +351,67 @@ public class UdpNetworkClient : MonoBehaviour
                 targetPos = position
             };
 
+            // Create GameObject only once and keep it
             player.go = GameObject.CreatePrimitive(PrimitiveType.Capsule);
-            player.go.name = id == localPlayerId ? $"Local_{name}" : $"Remote_{name}";
+            player.go.name = id == localPlayerId ? $"Local_{name}" : 
+                             isNPC ? $"Bot_{name}" : $"Remote_{name}";
+            player.go.transform.position = position;
 
-            if (id == localPlayerId)
+            // Set up renderer once
+            var renderer = player.go.GetComponent<Renderer>();
+            if (renderer)
             {
-                var renderer = player.go.GetComponent<Renderer>();
-                if (renderer) renderer.material.color = Color.green;
-
-                // Add local player controller
-                if (player.go.GetComponent<LocalPlayerController>() == null)
+                if (id == localPlayerId)
                 {
-                    var controller = player.go.AddComponent<LocalPlayerController>();
-                    controller.SetNetworkClient(this); // Pass UDP client reference
+                    renderer.material.color = Color.green;
+                    // Add local player controller only once
+                    if (player.go.GetComponent<LocalPlayerController>() == null)
+                    {
+                        var controller = player.go.AddComponent<LocalPlayerController>();
+                        controller.SetNetworkClient(this);
+                        Debug.Log("[UdpNetworkClient] Added LocalPlayerController to local player");
+                    }
+                }
+                else if (isNPC)
+                {
+                    renderer.material.color = Color.red;
+                    player.go.transform.localScale = Vector3.one * 1.5f;
+                }
+                else
+                {
+                    renderer.material.color = Color.blue;
                 }
             }
 
             Players[id] = player;
-            Debug.Log($"[UdpNetworkClient] Created {(id == localPlayerId ? "LOCAL" : "REMOTE")} player {name}");
+            
+            // Only log creation occasionally
+            if (id == localPlayerId || Time.frameCount % 300 == 0)
+            {
+                Debug.Log($"[UdpNetworkClient] Created {(id == localPlayerId ? "LOCAL" : (isNPC ? "BOT" : "REMOTE"))} player {name}");
+            }
+        }
+        else
+        {
+            // Player exists - just update position (NO GameObject creation/destruction)
+            player.targetPos = position;
+            
+            // Update name if it changed (rare)
+            if (player.name != name)
+            {
+                player.name = name;
+                if (player.go != null)
+                {
+                    player.go.name = id == localPlayerId ? $"Local_{name}" : 
+                                     isNPC ? $"Bot_{name}" : $"Remote_{name}";
+                }
+            }
         }
 
-        // Update position
-        player.targetPos = position;
-        
         // Handle local player reconciliation
         if (player.id == localPlayerId)
         {
-            var controller = player.go.GetComponent<LocalPlayerController>();
+            var controller = player.go?.GetComponent<LocalPlayerController>();
             if (controller != null)
             {
                 controller.ReceiveServerState(position, Time.time);
@@ -284,7 +419,27 @@ public class UdpNetworkClient : MonoBehaviour
         }
 
         player.lastUpdateTime = Time.time;
+        
+        // Debug: Count total objects in scene (only occasionally for performance)
+        if (Time.frameCount % 300 == 0) // Every 5 seconds at 60fps
+        {
+            int totalPlayers = Players.Count;
+            int activeBots = 0;
+            foreach (var p in Players.Values)
+            {
+                if (p.go != null && p.go.name.StartsWith("Bot_"))
+                    activeBots++;
+            }
+            Debug.Log($"[UdpNetworkClient] Total players in dictionary: {totalPlayers}, Active bot GameObjects: {activeBots}");
+        }
     }
+
+    [Header("Performance Settings")]
+    [SerializeField] private bool useBinaryProtocol = false; // Disabled for now
+    [SerializeField] private bool useObjectPooling = false; // Disabled for now
+    
+    // private GameObjectPool objectPool; // Commented out for now
+    private int _updateIndex = 0; // For batched updates
 
     private void Update()
     {
@@ -295,15 +450,25 @@ public class UdpNetworkClient : MonoBehaviour
             _lastHeartbeat = Time.time;
         }
 
-        // Interpolate remote players
-        foreach (var kv in Players)
+        // Interpolate remote players in batches to improve performance
+        var playerList = Players.Values.ToList();
+        const int playersPerFrame = 20; // Process only 20 players per frame
+        
+        for (int i = 0; i < playersPerFrame && i < playerList.Count; i++)
         {
-            var player = kv.Value;
+            var index = (_updateIndex + i) % playerList.Count;
+            var player = playerList[index];
+            
             if (player.go == null || player.id == localPlayerId) continue;
 
             var current = player.go.transform.position;
-            player.go.transform.position = Vector3.Lerp(current, player.targetPos, 10f * Time.deltaTime);
+            var target = player.targetPos;
+            
+            // Use faster interpolation for smoother movement
+            player.go.transform.position = Vector3.Lerp(current, target, 15f * Time.deltaTime);
         }
+        
+        _updateIndex = (_updateIndex + playersPerFrame) % Math.Max(playerList.Count, 1);
     }
 
     // Helper methods for JSON parsing
@@ -334,12 +499,40 @@ public class UdpNetworkClient : MonoBehaviour
         if (startIndex < 0) return 0f;
         startIndex += marker.Length;
         var endIndex = startIndex;
-        while (endIndex < src.Length && "0123456789.-".IndexOf(src[endIndex]) >= 0) endIndex++;
+        
+        // Extract only valid float characters: digits, minus sign, and decimal point
+        while (endIndex < src.Length)
+        {
+            char c = src[endIndex];
+            if (char.IsDigit(c) || c == '.' || c == '-')
+                endIndex++;
+            else
+                break; // Stop at comma, space, or any other delimiter
+        }
+        
         var floatStr = src.Substring(startIndex, endIndex - startIndex);
-        return float.TryParse(floatStr, out var f) ? f : 0f;
+        
+        // Remove debug log to improve performance - only log parsing errors
+        // Debug.Log($"[UdpNetworkClient] ExtractFloat: marker='{marker}', extracted='{floatStr}'");
+        
+        return float.TryParse(floatStr, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var f) ? f : 0f;
     }
 
-    private async void OnApplicationQuit()
+    private bool ExtractBool(string src, string marker)
+    {
+        var startIndex = src.IndexOf(marker);
+        if (startIndex < 0) return false;
+        startIndex += marker.Length;
+        
+        if (startIndex + 4 <= src.Length && src.Substring(startIndex, 4) == "true")
+            return true;
+        if (startIndex + 5 <= src.Length && src.Substring(startIndex, 5) == "false")
+            return false;
+            
+        return false;
+    }
+
+    private void OnApplicationQuit()
     {
         try
         {

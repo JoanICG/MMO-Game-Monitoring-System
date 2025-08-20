@@ -1,0 +1,6 @@
+C:\Users\joani\MMO_Project\MMO-Game-Monitoring-System\Backend\src\obj\Debug\net8.0\Backend.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\joani\MMO_Project\MMO-Game-Monitoring-System\Backend\src\obj\Debug\net8.0\Backend.AssemblyInfoInputs.cache
+C:\Users\joani\MMO_Project\MMO-Game-Monitoring-System\Backend\src\obj\Debug\net8.0\Backend.AssemblyInfo.cs
+C:\Users\joani\MMO_Project\MMO-Game-Monitoring-System\Backend\src\obj\Debug\net8.0\Backend.csproj.CoreCompileInputs.cache
+C:\Users\joani\MMO_Project\MMO-Game-Monitoring-System\Backend\src\obj\Debug\net8.0\Backend.MvcApplicationPartsAssemblyInfo.cache
+C:\Users\joani\MMO_Project\MMO-Game-Monitoring-System\Backend\src\obj\Debug\net8.0\Backend.sourcelink.json

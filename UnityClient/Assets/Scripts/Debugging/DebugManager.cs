@@ -88,7 +88,7 @@ public class DebugManager : MonoBehaviour
         GUI.BeginGroup(rect);
         GUI.Box(new Rect(0, 0, 240, 100), "Debug Info");
         
-        var networkClient = NetworkClient.Instance;
+        var networkClient = UdpNetworkClient.Instance;
         if (networkClient != null)
         {
             GUI.Label(new Rect(10, 25, 220, 20), $"Players: {networkClient.Players.Count}");
@@ -97,7 +97,7 @@ public class DebugManager : MonoBehaviour
         }
         else
         {
-            GUI.Label(new Rect(10, 25, 220, 20), "NetworkClient not found");
+            GUI.Label(new Rect(10, 25, 220, 20), "UdpNetworkClient not found");
         }
         
         GUI.EndGroup();
@@ -110,7 +110,7 @@ public class DebugManager : MonoBehaviour
     
     private void ShowPlayerLabels()
     {
-        var networkClient = NetworkClient.Instance;
+        var networkClient = UdpNetworkClient.Instance;
         if (networkClient == null) return;
         
         foreach (var player in networkClient.Players.Values)

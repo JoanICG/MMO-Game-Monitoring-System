@@ -3,510 +3,705 @@ using Backend;
 var builder = WebApplication.CreateBuilder(args);
 var app = builder.Build();
 
-app.UseWebSockets();
 app.UseStaticFiles(); // Para servir archivos estáticos
 
-var session = new GameSession();
 var udpServer = new UdpGameServer(8081); // UDP on port 8081
 
 // Start UDP server
 _ = Task.Run(() => udpServer.StartAsync());
 
-app.MapGet("/health", () => Results.Ok(new { status = "ok", websocket_port = 8080, udp_port = 8081 }));
+app.MapGet("/health", () => Results.Ok(new { status = "ok", udp_port = 8081 }));
 
-// Panel de administración
+// Simple status page instead of admin panel
 app.MapGet("/admin", async ctx =>
 {
     ctx.Response.ContentType = "text/html; charset=utf-8";
-    await ctx.Response.WriteAsync(GetAdminPanel());
+    await ctx.Response.WriteAsync(GetStatusPage());
 });
 
-// WebSocket for compatibility (clients should prefer UDP)
-app.Map("/ws", async ctx =>
+// Bot Management Admin Panel
+app.MapGet("/admin/bots", async ctx =>
 {
-    if (!ctx.WebSockets.IsWebSocketRequest)
-    {
-        ctx.Response.StatusCode = 400;
-        await ctx.Response.WriteAsync("Expected WebSocket");
-        return;
-    }
-    using var socket = await ctx.WebSockets.AcceptWebSocketAsync();
-    Console.WriteLine("[Program] WebSocket accepted /ws (client) - Consider upgrading to UDP");
-    await session.HandleAsync(socket, false); // false = not admin
+    ctx.Response.ContentType = "text/html; charset=utf-8";
+    await ctx.Response.WriteAsync(GetBotManagementPage());
 });
 
-// WebSocket for admin
-app.Map("/admin-ws", async ctx =>
+// API endpoint for bot management stats
+app.MapGet("/api/bot-stats", () =>
 {
-    if (!ctx.WebSockets.IsWebSocketRequest)
-    {
-        ctx.Response.StatusCode = 400;
-        await ctx.Response.WriteAsync("Expected WebSocket");
-        return;
-    }
-    using var socket = await ctx.WebSockets.AcceptWebSocketAsync();
-    Console.WriteLine("[Program] WebSocket accepted /admin-ws (admin)");
-    await session.HandleAsync(socket, true); // true = admin
+    var botManager = BotManagementSystem.Instance;
+    var stats = botManager.GetSystemStats();
+    return Results.Ok(stats);
 });
 
-static string GetAdminPanel()
+// Bot Management API Endpoints
+app.MapPost("/api/bot-containers", (CreateContainerRequest request) =>
+{
+    Console.WriteLine($"[DEBUG] Creating container: {request.Name} with {request.MaxBots} max bots");
+    var botManager = BotManagementSystem.Instance;
+    var container = botManager.CreateContainer(request.Name, request.MaxBots);
+    if (container != null)
+    {
+        Console.WriteLine($"[DEBUG] Container created successfully: {container.Id}");
+        return Results.Ok(new { containerId = container.Id, message = $"Container '{request.Name}' created successfully" });
+    }
+    Console.WriteLine($"[DEBUG] Failed to create container");
+    return Results.BadRequest(new { message = "Failed to create container" });
+});
+
+app.MapDelete("/api/bot-containers/{containerId:guid}", (Guid containerId) =>
+{
+    var botManager = BotManagementSystem.Instance;
+    if (botManager.RemoveContainer(containerId))
+    {
+        return Results.Ok(new { message = "Container removed successfully" });
+    }
+    return Results.NotFound(new { message = "Container not found" });
+});
+
+app.MapPost("/api/bot-containers/{containerId:guid}/bots", (Guid containerId, SpawnBotsRequest request) =>
+{
+    Console.WriteLine($"[DEBUG] Spawning {request.Count} bots in container {containerId}");
+    var botManager = BotManagementSystem.Instance;
+    var container = botManager.GetContainer(containerId);
+    if (container == null)
+    {
+        Console.WriteLine($"[DEBUG] Container {containerId} not found");
+        return Results.NotFound(new { message = "Container not found" });
+    }
+
+    int spawned = 0;
+    for (int i = 0; i < request.Count; i++)
+    {
+        if (container.AddBot($"Bot_{DateTime.Now:HHmmss}_{i + 1}"))
+        {
+            spawned++;
+        }
+    }
+
+    Console.WriteLine($"[DEBUG] Spawned {spawned} bots successfully");
+    return Results.Ok(new { spawned, message = $"Spawned {spawned} bots" });
+});
+
+app.MapDelete("/api/bot-containers/{containerId:guid}/bots", (Guid containerId) =>
+{
+    var botManager = BotManagementSystem.Instance;
+    var container = botManager.GetContainer(containerId);
+    if (container == null)
+    {
+        return Results.NotFound(new { message = "Container not found" });
+    }
+
+    container.RemoveAllBots();
+    return Results.Ok(new { message = "All bots removed from container" });
+});
+
+app.MapPost("/api/bot-containers/{containerId:guid}/pause", (Guid containerId) =>
+{
+    var botManager = BotManagementSystem.Instance;
+    var container = botManager.GetContainer(containerId);
+    if (container == null)
+    {
+        return Results.NotFound(new { message = "Container not found" });
+    }
+
+    container.PauseAllBots();
+    return Results.Ok(new { message = "Container bots paused" });
+});
+
+app.MapPost("/api/bot-containers/{containerId:guid}/resume", (Guid containerId) =>
+{
+    var botManager = BotManagementSystem.Instance;
+    var container = botManager.GetContainer(containerId);
+    if (container == null)
+    {
+        return Results.NotFound(new { message = "Container not found" });
+    }
+
+    container.ResumeAllBots();
+    return Results.Ok(new { message = "Container bots resumed" });
+});
+
+app.MapPost("/api/bots/pause-all", () =>
+{
+    var botManager = BotManagementSystem.Instance;
+    botManager.PauseAllBots();
+    return Results.Ok(new { message = "All bots paused" });
+});
+
+app.MapPost("/api/bots/resume-all", () =>
+{
+    var botManager = BotManagementSystem.Instance;
+    botManager.ResumeAllBots();
+    return Results.Ok(new { message = "All bots resumed" });
+});
+
+app.MapDelete("/api/bots/remove-all", () =>
+{
+    var botManager = BotManagementSystem.Instance;
+    botManager.RemoveAllBots();
+    return Results.Ok(new { message = "All bots removed" });
+});
+
+app.MapDelete("/api/bot-containers", () =>
+{
+    var botManager = BotManagementSystem.Instance;
+    botManager.RemoveAllContainers();
+    return Results.Ok(new { message = "All containers removed" });
+});
+
+static string GetStatusPage()
 {
     return """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>🤖 MMO Admin Panel - Bot Control</title>
+    <title>🚀 MMO Server Status - UDP Only</title>
     <style>
-        body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
-        .container { max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; }
-        .status { padding: 10px; margin: 10px 0; border-radius: 4px; }
-        .connected { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
-        .disconnected { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
-        .section { margin: 20px 0; padding: 15px; border: 1px solid #dee2e6; border-radius: 8px; }
-        .bot-section { background: #e7f3ff; }
-        .player { background: #e9ecef; padding: 10px; margin: 5px 0; border-radius: 4px; display: flex; justify-content: space-between; align-items: center; }
-        .bot { background: #cce5ff; border-left: 4px solid #007bff; }
-        .controls { margin: 20px 0; }
-        .btn { padding: 8px 16px; margin: 5px; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; }
-        .btn-primary { background: #007bff; color: white; }
-        .btn-danger { background: #dc3545; color: white; }
-        .btn-success { background: #28a745; color: white; }
-        .btn-warning { background: #ffc107; color: black; }
-        .btn-info { background: #17a2b8; color: white; }
-        .input { padding: 8px; margin: 5px; border: 1px solid #ddd; border-radius: 4px; width: 80px; }
-        .input-name { width: 120px; }
-        .logs { background: #f8f9fa; padding: 10px; margin: 10px 0; max-height: 200px; overflow-y: auto; font-family: monospace; font-size: 12px; border: 1px solid #dee2e6; border-radius: 4px; }
-        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; text-align: center; }
+        .container { max-width: 800px; margin: 0 auto; background: white; padding: 40px; border-radius: 8px; }
+        .status { padding: 20px; margin: 20px 0; border-radius: 8px; background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        .info { background: #e7f3ff; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #007bff; }
+        .code { background: #f8f9fa; padding: 15px; border-radius: 4px; font-family: monospace; margin: 10px 0; border: 1px solid #dee2e6; }
+        h1 { color: #333; margin-bottom: 30px; }
+        h2 { color: #666; margin-top: 30px; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>🤖 MMO Admin Panel - Bot Control System</h1>
+        <h1>🚀 MMO Server - UDP Protocol</h1>
         
-        <div id="status" class="status disconnected">
-            Disconnected
+        <div class="status">
+            ✅ Server is running on UDP port 8081
         </div>
         
-        <div class="grid">
-            <div class="section bot-section">
-                <h3>🤖 Bot Management</h3>
-                
-                <h4>Spawn Bot</h4>
-                <input type="text" id="botName" class="input input-name" placeholder="Bot Name" value="Bot">
-                <input type="number" id="botX" class="input" placeholder="X" value="0" step="0.1">
-                <input type="number" id="botY" class="input" placeholder="Y" value="0" step="0.1">
-                <input type="number" id="botZ" class="input" placeholder="Z" value="0" step="0.1">
-                <select id="botBehavior" class="input">
-                    <option value="idle">Idle</option>
-                    <option value="random">Random Movement</option>
-                    <option value="patrol">Patrol</option>
-                </select>
-                <button class="btn btn-success" onclick="spawnBot()">🤖 Spawn Bot</button>
-                
-                <h4>Bot Commands</h4>
-                <button class="btn btn-info" onclick="randomizeAllBots()">🎲 Randomize All Bots</button>
-                <button class="btn btn-warning" onclick="stopAllBots()">⏹️ Stop All Bots</button>
-                <button class="btn btn-danger" onclick="removeAllBots()">🗑️ Remove All Bots</button>
-                
-                <h4>🚀 Benchmark / Stress Testing</h4>
-                <div style="background: #fff3cd; padding: 10px; margin: 10px 0; border-radius: 4px; border: 1px solid #ffeaa7;">
-                    <strong>⚠️ Warning:</strong> Benchmark mode spawns many bots for performance testing
-                </div>
-                <input type="number" id="benchmarkCount" class="input" placeholder="Bot Count" value="100" min="1" max="1000">
-                <select id="benchmarkBehavior" class="input">
-                    <option value="random">Random Movement</option>
-                    <option value="idle">Idle</option>
-                    <option value="patrol">Patrol</option>
-                </select>
-                <input type="number" id="benchmarkSpread" class="input" placeholder="Spread Radius" value="50" step="5">
-                <br>
-                <button class="btn btn-warning" onclick="spawnBenchmarkBots()">🚀 Spawn Benchmark Bots</button>
-                <button class="btn btn-danger" onclick="clearBenchmarkBots()">🧹 Clear Benchmark Bots</button>
-                
-                <div id="benchmarkMetrics" style="background: #e7f3ff; padding: 10px; margin: 10px 0; border-radius: 4px; border: 1px solid #007bff;">
-                    <strong>📊 Real-time Server Metrics:</strong>
-                    <div style="color: #666; margin-top: 5px;">Metrics will update automatically...</div>
-                </div>
-            </div>
-            
-            <div class="section">
-                <h3>👥 Player Management</h3>
-                
-                <h4>Spawn NPC</h4>
-                <input type="text" id="npcName" class="input input-name" placeholder="NPC Name" value="NPC">
-                <input type="number" id="npcX" class="input" placeholder="X" value="0" step="0.1">
-                <input type="number" id="npcY" class="input" placeholder="Y" value="0" step="0.1">
-                <input type="number" id="npcZ" class="input" placeholder="Z" value="0" step="0.1">
-                <button class="btn btn-success" onclick="spawnNPC()">👤 Spawn NPC</button>
-                
-                <h4>Global Commands</h4>
-                <button class="btn btn-primary" onclick="teleportAll()">📍 Teleport All to Origin</button>
-                <button class="btn btn-danger" onclick="kickAll()">🚫 Kick All Players</button>
+        <div class="info">
+            <h2>📡 Connection Information</h2>
+            <p><strong>Protocol:</strong> UDP (High Performance)</p>
+            <p><strong>Port:</strong> 8081</p>
+            <p><strong>Server IP:</strong> localhost (127.0.0.1)</p>
+        </div>
+        
+        <div class="info">
+            <h2>🎮 Unity Client Setup</h2>
+            <p>Make sure your Unity client is configured to connect via UDP:</p>
+            <div class="code">
+                Server Host: localhost<br>
+                Server Port: 8081<br>
+                Protocol: UDP
             </div>
         </div>
         
-        <div class="section">
-            <h3>Connected Entities</h3>
-            <div id="playerList"></div>
+        <div class="info">
+            <h2>🔧 Technical Details</h2>
+            <p><strong>Why UDP?</strong></p>
+            <ul style="text-align: left; display: inline-block;">
+                <li>⚡ Lower latency than WebSocket/TCP</li>
+                <li>🚀 Better performance for real-time games</li>
+                <li>📦 Smaller packet overhead</li>
+                <li>🎯 Designed for fast-paced multiplayer gaming</li>
+            </ul>
         </div>
         
-        <div class="logs" id="logs"></div>
+        <div class="info">
+            <h2>📊 Server Capabilities</h2>
+            <ul style="text-align: left; display: inline-block;">
+                <li>✅ Player join/leave management</li>
+                <li>✅ Real-time movement synchronization</li>
+                <li>✅ Client-side prediction support</li>
+                <li>✅ Server authority with reconciliation</li>
+                <li>✅ Advanced bot management system</li>
+                <li>✅ Performance optimization for 100+ entities</li>
+            </ul>
+        </div>
+        
+        <div class="info">
+            <h2>🤖 Bot Management</h2>
+            <p>El servidor incluye un sistema avanzado de gestión de bots con:</p>
+            <ul style="text-align: left; display: inline-block;">
+                <li>🏗️ Contenedores de bots para organización eficiente</li>
+                <li>🎯 Lógica de movimiento aleatorio inteligente</li>
+                <li>⚡ Control de rendimiento y optimización</li>
+                <li>📊 Estadísticas en tiempo real</li>
+                <li>🎮 Interfaz de administración web</li>
+            </ul>
+            <p style="margin-top: 20px;">
+                <a href="/admin/bots" style="background: #3498db; color: white; padding: 15px 30px; text-decoration: none; border-radius: 5px; display: inline-block;">
+                    🤖 Abrir Panel de Gestión de Bots
+                </a>
+            </p>
+        </div>
+        
+        <p style="margin-top: 40px; color: #666; font-size: 14px;">
+            WebSocket functionality has been removed for optimal UDP performance
+        </p>
+    </div>
+</body>
+</html>
+""";
+}
+
+static string GetBotManagementPage()
+{
+    return """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>🤖 Bot Management System - MMO Server</title>
+    <style>
+        body { font-family: 'Segoe UI', Arial, sans-serif; margin: 0; background: #f5f5f5; }
+        .header { background: #2c3e50; color: white; padding: 20px; text-align: center; }
+        .container { max-width: 1200px; margin: 20px auto; padding: 20px; }
+        .card { background: white; margin: 20px 0; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin: 20px 0; }
+        .stat-card { background: #3498db; color: white; padding: 20px; border-radius: 8px; text-align: center; }
+        .stat-number { font-size: 2em; font-weight: bold; }
+        .stat-label { margin-top: 5px; opacity: 0.9; }
+        .btn { padding: 10px 20px; margin: 5px; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; }
+        .btn-primary { background: #3498db; color: white; }
+        .btn-success { background: #27ae60; color: white; }
+        .btn-warning { background: #f39c12; color: white; }
+        .btn-danger { background: #e74c3c; color: white; }
+        .btn:hover { opacity: 0.9; }
+        .form-group { margin: 15px 0; }
+        .form-group label { display: block; margin-bottom: 5px; font-weight: bold; }
+        .form-group input, .form-group select { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; }
+        .container-list { margin-top: 20px; }
+        .container-item { border: 1px solid #ddd; margin: 10px 0; padding: 15px; border-radius: 8px; background: #f9f9f9; }
+        .container-header { display: flex; justify-content: between; align-items: center; margin-bottom: 10px; }
+        .container-name { font-size: 1.2em; font-weight: bold; color: #2c3e50; }
+        .container-stats { font-size: 0.9em; color: #666; margin: 5px 0; }
+        .bot-actions { margin-top: 10px; }
+        .log { background: #2c3e50; color: #00ff00; padding: 15px; border-radius: 8px; font-family: 'Courier New', monospace; height: 200px; overflow-y: auto; margin-top: 20px; }
+        .status-indicator { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 8px; }
+        .status-active { background: #27ae60; }
+        .status-inactive { background: #e74c3c; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🤖 Bot Management System</h1>
+        <p>Control y gestión avanzada de bots para MMO Server</p>
+    </div>
+    
+    <div class="container">
+        <!-- System Stats -->
+        <div class="card">
+            <h2>📊 Estadísticas del Sistema</h2>
+            <div class="stats-grid" id="statsGrid">
+                <div class="stat-card">
+                    <div class="stat-number" id="totalContainers">0</div>
+                    <div class="stat-label">Contenedores</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number" id="totalBots">0</div>
+                    <div class="stat-label">Total Bots</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number" id="activeBots">0</div>
+                    <div class="stat-label">Bots Activos</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-number" id="pausedBots">0</div>
+                    <div class="stat-label">Bots Pausados</div>
+                </div>
+            </div>
+            <button class="btn btn-primary" onclick="refreshStats()">🔄 Actualizar Stats</button>
+        </div>
+        
+        <!-- Container Management -->
+        <div class="card">
+            <h2>📦 Gestión de Contenedores</h2>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+                <div>
+                    <h3>Crear Nuevo Contenedor</h3>
+                    <div class="form-group">
+                        <label>Nombre del Contenedor:</label>
+                        <input type="text" id="containerName" placeholder="Ej: BotGroup_01" value="BotGroup_01">
+                    </div>
+                    <div class="form-group">
+                        <label>Máximo de Bots:</label>
+                        <input type="number" id="maxBots" min="1" max="100" value="25">
+                    </div>
+                    <button class="btn btn-success" onclick="createContainer()">➕ Crear Contenedor</button>
+                </div>
+                <div>
+                    <h3>Acciones Globales</h3>
+                    <button class="btn btn-warning" onclick="pauseAllBots()">⏸️ Pausar Todos los Bots</button>
+                    <button class="btn btn-success" onclick="resumeAllBots()">▶️ Resumir Todos los Bots</button>
+                    <button class="btn btn-danger" onclick="removeAllBots()">🗑️ Eliminar Todos los Bots</button>
+                    <button class="btn btn-danger" onclick="removeAllContainers()">🗑️ Eliminar Todos los Contenedores</button>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Container List -->
+        <div class="card">
+            <h2>🗂️ Lista de Contenedores</h2>
+            <div id="containerList" class="container-list">
+                <p>Cargando contenedores...</p>
+            </div>
+        </div>
+        
+        <!-- Quick Actions -->
+        <div class="card">
+            <h2>⚡ Acciones Rápidas</h2>
+            <button class="btn btn-primary" onclick="createTestEnvironment()">🧪 Crear Entorno de Prueba</button>
+            <button class="btn btn-warning" onclick="createStressTest()">🔥 Test de Estrés (50 bots)</button>
+            <button class="btn btn-success" onclick="createDefaultContainer()">📦 Contenedor por Defecto</button>
+        </div>
+        
+        <!-- System Log -->
+        <div class="card">
+            <h2>📋 Log del Sistema</h2>
+            <div id="systemLog" class="log">
+                [BOT MANAGEMENT] Sistema iniciado...<br>
+                [INFO] Esperando comandos...<br>
+            </div>
+        </div>
     </div>
 
     <script>
-        let ws = null;
-        let players = {};
-
-        function connect() {
-            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            ws = new WebSocket(`${protocol}//${window.location.host}/admin-ws`);
-            
-            ws.onopen = () => {
-                updateStatus('Connected - Bot Control Active', true);
-                addLog('Connected to admin WebSocket with bot control');
-                ws.send(JSON.stringify({op: 'admin_join', name: 'BotAdmin'}));
-            };
-            
-            ws.onclose = () => {
-                updateStatus('Disconnected', false);
-                addLog('Disconnected from admin WebSocket');
-                setTimeout(connect, 3000);
-            };
-            
-            ws.onmessage = (event) => {
-                const msg = JSON.parse(event.data);
-                addLog(`RX: ${event.data}`);
-                
-                if (msg.op === 'state') {
-                    players = {};
-                    msg.players.forEach(p => {
-                        players[p.id] = p;
-                    });
-                    updatePlayerList();
-                    
-                    // Update benchmark metrics if available
-                    if (msg.benchmarkMetrics) {
-                        updateBenchmarkMetrics(msg.benchmarkMetrics);
-                    }
-                }
-            };
-        }
-
-        function updateStatus(text, connected) {
-            const status = document.getElementById('status');
-            status.textContent = text;
-            status.className = `status ${connected ? 'connected' : 'disconnected'}`;
-        }
-
-        function addLog(text) {
-            const logs = document.getElementById('logs');
-            const time = new Date().toLocaleTimeString();
-            logs.innerHTML += `${time}: ${text}\n`;
-            logs.scrollTop = logs.scrollHeight;
-        }
-
-        function updatePlayerList() {
-            const list = document.getElementById('playerList');
-            list.innerHTML = '';
-            
-            Object.values(players).forEach(player => {
-                const div = document.createElement('div');
-                const isBot = player.name.includes('Bot') || player.isNpc;
-                div.className = `player ${isBot ? 'bot' : ''}`;
-                
-                const entityType = isBot ? '🤖' : '👤';
-                const controls = isBot ? getBotControls(player.id) : getPlayerControls(player.id);
-                
-                div.innerHTML = `
-                    <span>${entityType} <strong>${player.name}</strong> (${player.id.substring(0,8)}...) - Position: (${player.x.toFixed(1)}, ${player.y.toFixed(1)}, ${player.z.toFixed(1)})</span>
-                    <div>${controls}</div>
-                `;
-                list.appendChild(div);
-            });
-        }
-
-        function getBotControls(botId) {
-            return `
-                <button class="btn btn-info" onclick="setBotBehavior('${botId}', 'random')">🎲 Random</button>
-                <button class="btn btn-warning" onclick="setBotBehavior('${botId}', 'patrol')">🚶 Patrol</button>
-                <button class="btn btn-primary" onclick="setBotBehavior('${botId}', 'idle')">⏹️ Stop</button>
-                <button class="btn btn-primary" onclick="controlBot('${botId}')">🎮 Control</button>
-                <button class="btn btn-danger" onclick="kickPlayer('${botId}')">🗑️ Remove</button>
-            `;
-        }
-
-        function getPlayerControls(playerId) {
-            return `
-                <button class="btn btn-primary" onclick="teleportPlayer('${playerId}')">📍 Teleport</button>
-                <button class="btn btn-danger" onclick="kickPlayer('${playerId}')">🚫 Kick</button>
-            `;
-        }
-
-        // Bot Functions
-        function spawnBot() {
-            const name = document.getElementById('botName').value || 'Bot';
-            const x = parseFloat(document.getElementById('botX').value) || 0;
-            const y = parseFloat(document.getElementById('botY').value) || 0;
-            const z = parseFloat(document.getElementById('botZ').value) || 0;
-            const behavior = document.getElementById('botBehavior').value || 'idle';
-            
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({
-                    op: 'admin_spawn_bot',
-                    name: name,
-                    x: x, y: y, z: z,
-                    behavior: behavior
-                }));
-                addLog(`🤖 Spawning Bot: ${name} at (${x}, ${y}, ${z}) with ${behavior} behavior`);
-            }
-        }
-
-        function setBotBehavior(botId, behavior) {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({
-                    op: 'admin_bot_behavior',
-                    botId: botId,
-                    behavior: behavior
-                }));
-                addLog(`🤖 Setting bot ${botId.substring(0,8)} behavior to ${behavior}`);
-            }
-        }
-
-        function controlBot(botId) {
-            const x = prompt('Enter X coordinate:') || 0;
-            const y = prompt('Enter Y coordinate:') || 0;
-            const z = prompt('Enter Z coordinate:') || 0;
-            
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({
-                    op: 'admin_control_bot',
-                    botId: botId,
-                    x: parseFloat(x),
-                    y: parseFloat(y),
-                    z: parseFloat(z)
-                }));
-                addLog(`🎮 Controlling bot ${botId.substring(0,8)} to (${x}, ${y}, ${z})`);
-            }
-        }
-
-        function randomizeAllBots() {
-            Object.values(players).forEach(player => {
-                if (player.name.includes('Bot') || player.isNpc) {
-                    setBotBehavior(player.id, 'random');
-                }
-            });
-        }
-
-        function stopAllBots() {
-            Object.values(players).forEach(player => {
-                if (player.name.includes('Bot') || player.isNpc) {
-                    setBotBehavior(player.id, 'idle');
-                }
-            });
-        }
-
-        function removeAllBots() {
-            if (confirm('Remove all bots?')) {
-                Object.values(players).forEach(player => {
-                    if (player.name.includes('Bot') || player.isNpc) {
-                        kickPlayer(player.id);
-                    }
+        let currentStats = {};
+        
+        // Auto-refresh stats every 5 seconds
+        setInterval(refreshStats, 5000);
+        
+        // Initial load
+        refreshStats();
+        
+        function refreshStats() {
+            fetch('/api/bot-stats')
+                .then(response => response.json())
+                .then(data => {
+                    currentStats = data;
+                    updateStatsDisplay(data);
+                    updateContainerList(data.containerStats);
+                })
+                .catch(error => {
+                    logMessage(`[ERROR] Failed to fetch stats: ${error.message}`, 'error');
                 });
-            }
         }
-
-        // Original Functions
-        function spawnNPC() {
-            const name = document.getElementById('npcName').value || 'NPC';
-            const x = parseFloat(document.getElementById('npcX').value) || 0;
-            const y = parseFloat(document.getElementById('npcY').value) || 0;
-            const z = parseFloat(document.getElementById('npcZ').value) || 0;
+        
+        function updateStatsDisplay(stats) {
+            document.getElementById('totalContainers').textContent = stats.totalContainers;
+            document.getElementById('totalBots').textContent = stats.totalBots;
+            document.getElementById('activeBots').textContent = stats.activeBots;
+            document.getElementById('pausedBots').textContent = stats.pausedBots;
+        }
+        
+        function updateContainerList(containers) {
+            const containerList = document.getElementById('containerList');
             
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({
-                    op: 'admin_spawn_npc',
-                    name: name, x: x, y: y, z: z
-                }));
-                addLog(`👤 Spawning NPC: ${name} at (${x}, ${y}, ${z})`);
-            }
-        }
-
-        function teleportPlayer(playerId) {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({
-                    op: 'admin_teleport',
-                    playerId: playerId,
-                    x: 0, y: 0, z: 0
-                }));
-                addLog(`📍 Teleporting ${playerId.substring(0,8)} to origin`);
-            }
-        }
-
-        function kickPlayer(playerId) {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({
-                    op: 'admin_kick',
-                    playerId: playerId
-                }));
-                addLog(`🗑️ Removing ${playerId.substring(0,8)}`);
-            }
-        }
-
-        function teleportAll() {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({
-                    op: 'admin_teleport_all',
-                    x: 0, y: 0, z: 0
-                }));
-                addLog('📍 Teleporting all to origin');
-            }
-        }
-
-        function kickAll() {
-            if (confirm('Kick all players?')) {
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                    ws.send(JSON.stringify({op: 'admin_kick_all'}));
-                    addLog('🚫 Kicking all players');
-                }
-            }
-        }
-
-        // Benchmark Functions
-        function spawnBenchmarkBots() {
-            const count = parseInt(document.getElementById('benchmarkCount').value) || 100;
-            const behavior = document.getElementById('benchmarkBehavior').value || 'random';
-            const spreadRadius = parseFloat(document.getElementById('benchmarkSpread').value) || 50;
-            
-            if (count > 500 && !confirm(`Are you sure you want to spawn ${count} bots? This may impact performance.`)) {
+            if (!containers || containers.length === 0) {
+                containerList.innerHTML = '<p>No hay contenedores activos.</p>';
                 return;
             }
             
-            // Spawn bots directly like simple clients
-            for (let i = 0; i < count; i++) {
-                setTimeout(() => {
-                    spawnSimpleBot(`Bot${Date.now()}_${i}`, behavior, spreadRadius);
-                }, i * 50); // Stagger spawning to avoid overwhelming
-            }
-            addLog(`🚀 Spawning ${count} benchmark bots with ${behavior} behavior (spread: ${spreadRadius})`);
-        }
-
-        // Store bot connections to manage them
-        const botConnections = [];
-
-        function spawnSimpleBot(name, behavior, spreadRadius) {
-            // Create a new WebSocket connection for each bot
-            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const botWs = new WebSocket(`${protocol}//${window.location.host}/ws`);
-            
-            botWs.onopen = function() {
-                // Spawn the bot
-                const x = (Math.random() - 0.5) * spreadRadius * 2;
-                const z = (Math.random() - 0.5) * spreadRadius * 2;
-                
-                botWs.send(JSON.stringify({
-                    action: 'spawn_bot',
-                    botId: name,
-                    x: x,
-                    z: z,
-                    strategy: behavior
-                }));
-                
-                // Start bot behavior
-                if (behavior === 'random') {
-                    startRandomMovement(botWs);
-                } else if (behavior === 'patrol') {
-                    startPatrolMovement(botWs);
-                }
-                
-                // Store connection for cleanup
-                botConnections.push(botWs);
-            };
-            
-            botWs.onerror = function(error) {
-                console.log(`Bot ${name} WebSocket error:`, error);
-            };
-            
-            botWs.onclose = function() {
-                // Remove from connections array
-                const index = botConnections.indexOf(botWs);
-                if (index > -1) {
-                    botConnections.splice(index, 1);
-                }
-            };
-        }
-
-        function startRandomMovement(botWs) {
-            const moveInterval = setInterval(() => {
-                if (botWs.readyState === WebSocket.OPEN) {
-                    const x = (Math.random() - 0.5) * 20; // Random movement in 20x20 area
-                    const z = (Math.random() - 0.5) * 20;
-                    
-                    botWs.send(JSON.stringify({
-                        action: 'move',
-                        x: x,
-                        z: z
-                    }));
-                } else {
-                    clearInterval(moveInterval);
-                }
-            }, 1000 + Math.random() * 2000); // Move every 1-3 seconds
-        }
-
-        function startPatrolMovement(botWs) {
-            let patrolIndex = 0;
-            const patrolPoints = [
-                {x: -5, z: -5},
-                {x: 5, z: -5},
-                {x: 5, z: 5},
-                {x: -5, z: 5}
-            ];
-            
-            const patrolInterval = setInterval(() => {
-                if (botWs.readyState === WebSocket.OPEN) {
-                    const point = patrolPoints[patrolIndex % patrolPoints.length];
-                    patrolIndex++;
-                    
-                    botWs.send(JSON.stringify({
-                        action: 'move',
-                        x: point.x,
-                        z: point.z
-                    }));
-                } else {
-                    clearInterval(patrolInterval);
-                }
-            }, 3000); // Move every 3 seconds
-        }
-
-        function clearBenchmarkBots() {
-            if (confirm('Remove all benchmark bots?')) {
-                // Close all bot connections
-                botConnections.forEach(ws => {
-                    if (ws.readyState === WebSocket.OPEN) {
-                        ws.close();
-                    }
-                });
-                botConnections.length = 0; // Clear the array
-                addLog('🧹 Clearing all benchmark bots');
-            }
-        }
-
-        function updateBenchmarkMetrics(metrics) {
-            const metricsContainer = document.getElementById('benchmarkMetrics');
-            if (metricsContainer) {
-                metricsContainer.innerHTML = `
-                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px;">
-                        <div><strong>Total Entities:</strong> ${metrics.totalEntities}</div>
-                        <div><strong>Real Players:</strong> ${metrics.realPlayers}</div>
-                        <div><strong>Total Bots:</strong> ${metrics.totalBots}</div>
-                        <div><strong>Active Bots:</strong> ${metrics.activeBots}</div>
-                        <div><strong>Memory Usage:</strong> ${metrics.memoryUsageMB} MB</div>
-                        <div><strong>Update Rate:</strong> ${metrics.updatesPerSecond} Hz</div>
+            containerList.innerHTML = containers.map(container => `
+                <div class="container-item">
+                    <div class="container-header">
+                        <div>
+                            <span class="status-indicator ${container.isActive ? 'status-active' : 'status-inactive'}"></span>
+                            <span class="container-name">${container.containerName}</span>
+                        </div>
+                        <div>
+                            <button class="btn btn-danger" onclick="removeContainer('${container.containerId}')">🗑️ Eliminar</button>
+                        </div>
                     </div>
-                `;
-            }
+                    <div class="container-stats">
+                        📊 Total: ${container.totalBots}/${container.maxBots} | 
+                        ✅ Activos: ${container.activeBots} | 
+                        ⏸️ Pausados: ${container.pausedBots} |
+                        📅 Creado: ${new Date(container.createdAt).toLocaleString()}
+                    </div>
+                    <div class="bot-actions">
+                        <button class="btn btn-success" onclick="spawnBots('${container.containerId}', 5)">➕ Agregar 5 Bots</button>
+                        <button class="btn btn-success" onclick="spawnBots('${container.containerId}', 10)">➕ Agregar 10 Bots</button>
+                        <button class="btn btn-warning" onclick="pauseContainerBots('${container.containerId}')">⏸️ Pausar</button>
+                        <button class="btn btn-success" onclick="resumeContainerBots('${container.containerId}')">▶️ Resumir</button>
+                        <button class="btn btn-danger" onclick="removeContainerBots('${container.containerId}')">🗑️ Eliminar Bots</button>
+                    </div>
+                </div>
+            `).join('');
         }
-
-        connect();
+        
+        function logMessage(message, type = 'info') {
+            const log = document.getElementById('systemLog');
+            const timestamp = new Date().toLocaleTimeString();
+            const color = type === 'error' ? '#ff6b6b' : type === 'success' ? '#51cf66' : '#00ff00';
+            log.innerHTML += `<span style="color: ${color}">[${timestamp}] ${message}</span><br>`;
+            log.scrollTop = log.scrollHeight;
+        }
+        
+        // API Functions 
+        function createContainer() {
+            const name = document.getElementById('containerName').value;
+            const maxBots = parseInt(document.getElementById('maxBots').value);
+            
+            if (!name.trim()) {
+                logMessage('[ERROR] El nombre del contenedor no puede estar vacío', 'error');
+                return;
+            }
+            
+            logMessage(`[ADMIN] Creando contenedor '${name}' con máximo ${maxBots} bots...`);
+            
+            fetch('/api/bot-containers', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ name: name, maxBots: maxBots })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.message) {
+                    logMessage(`[SUCCESS] ${data.message}`, 'success');
+                    refreshStats();
+                } else {
+                    logMessage('[ERROR] Error al crear contenedor', 'error');
+                }
+            })
+            .catch(error => {
+                logMessage(`[ERROR] Error al crear contenedor: ${error.message}`, 'error');
+            });
+        }
+        
+        function removeContainer(containerId) {
+            if (!confirm('¿Estás seguro de que quieres eliminar este contenedor y todos sus bots?')) {
+                return;
+            }
+            
+            logMessage(`[ADMIN] Eliminando contenedor ${containerId}...`);
+            
+            fetch(`/api/bot-containers/${containerId}`, {
+                method: 'DELETE'
+            })
+            .then(response => response.json())
+            .then(data => {
+                logMessage(`[SUCCESS] ${data.message}`, 'success');
+                refreshStats();
+            })
+            .catch(error => {
+                logMessage(`[ERROR] Error al eliminar contenedor: ${error.message}`, 'error');
+            });
+        }
+        
+        function spawnBots(containerId, count) {
+            logMessage(`[ADMIN] Creando ${count} bots en contenedor ${containerId}...`);
+            
+            fetch(`/api/bot-containers/${containerId}/bots`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ count: count })
+            })
+            .then(response => response.json())
+            .then(data => {
+                logMessage(`[SUCCESS] ${data.message}`, 'success');
+                refreshStats();
+            })
+            .catch(error => {
+                logMessage(`[ERROR] Error al crear bots: ${error.message}`, 'error');
+            });
+        }
+        
+        function pauseContainerBots(containerId) {
+            logMessage(`[ADMIN] Pausando bots en contenedor ${containerId}...`);
+            
+            fetch(`/api/bot-containers/${containerId}/pause`, {
+                method: 'POST'
+            })
+            .then(response => response.json())
+            .then(data => {
+                logMessage(`[SUCCESS] ${data.message}`, 'success');
+                refreshStats();
+            })
+            .catch(error => {
+                logMessage(`[ERROR] Error al pausar bots: ${error.message}`, 'error');
+            });
+        }
+        
+        function resumeContainerBots(containerId) {
+            logMessage(`[ADMIN] Resumiendo bots en contenedor ${containerId}...`);
+            
+            fetch(`/api/bot-containers/${containerId}/resume`, {
+                method: 'POST'
+            })
+            .then(response => response.json())
+            .then(data => {
+                logMessage(`[SUCCESS] ${data.message}`, 'success');
+                refreshStats();
+            })
+            .catch(error => {
+                logMessage(`[ERROR] Error al resumir bots: ${error.message}`, 'error');
+            });
+        }
+        
+        function removeContainerBots(containerId) {
+            if (!confirm('¿Estás seguro de que quieres eliminar todos los bots de este contenedor?')) {
+                return;
+            }
+            
+            logMessage(`[ADMIN] Eliminando todos los bots del contenedor ${containerId}...`);
+            
+            fetch(`/api/bot-containers/${containerId}/bots`, {
+                method: 'DELETE'
+            })
+            .then(response => response.json())
+            .then(data => {
+                logMessage(`[SUCCESS] ${data.message}`, 'success');
+                refreshStats();
+            })
+            .catch(error => {
+                logMessage(`[ERROR] Error al eliminar bots: ${error.message}`, 'error');
+            });
+        }
+        
+        function pauseAllBots() {
+            logMessage(`[ADMIN] Pausando todos los bots del sistema...`);
+            
+            fetch('/api/bots/pause-all', {
+                method: 'POST'
+            })
+            .then(response => response.json())
+            .then(data => {
+                logMessage(`[SUCCESS] ${data.message}`, 'success');
+                refreshStats();
+            })
+            .catch(error => {
+                logMessage(`[ERROR] Error al pausar bots: ${error.message}`, 'error');
+            });
+        }
+        
+        function resumeAllBots() {
+            logMessage(`[ADMIN] Resumiendo todos los bots del sistema...`);
+            
+            fetch('/api/bots/resume-all', {
+                method: 'POST'
+            })
+            .then(response => response.json())
+            .then(data => {
+                logMessage(`[SUCCESS] ${data.message}`, 'success');
+                refreshStats();
+            })
+            .catch(error => {
+                logMessage(`[ERROR] Error al resumir bots: ${error.message}`, 'error');
+            });
+        }
+        
+        function removeAllBots() {
+            if (!confirm('¿Estás seguro de que quieres eliminar TODOS los bots del sistema?')) {
+                return;
+            }
+            
+            logMessage(`[ADMIN] Eliminando todos los bots del sistema...`);
+            
+            fetch('/api/bots/remove-all', {
+                method: 'DELETE'
+            })
+            .then(response => response.json())
+            .then(data => {
+                logMessage(`[SUCCESS] ${data.message}`, 'success');
+                refreshStats();
+            })
+            .catch(error => {
+                logMessage(`[ERROR] Error al eliminar bots: ${error.message}`, 'error');
+            });
+        }
+        
+        function removeAllContainers() {
+            if (!confirm('¿Estás seguro de que quieres eliminar TODOS los contenedores y bots?')) {
+                return;
+            }
+            
+            logMessage(`[ADMIN] Eliminando todos los contenedores...`);
+            
+            fetch('/api/bot-containers', {
+                method: 'DELETE'
+            })
+            .then(response => response.json())
+            .then(data => {
+                logMessage(`[SUCCESS] ${data.message}`, 'success');
+                refreshStats();
+            })
+            .catch(error => {
+                logMessage(`[ERROR] Error al eliminar contenedores: ${error.message}`, 'error');
+            });
+        }
+        
+        function createTestEnvironment() {
+            logMessage(`[ADMIN] Creando entorno de prueba...`);
+            
+            // Crear dos contenedores de prueba
+            Promise.all([
+                fetch('/api/bot-containers', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: 'TestContainer_1', maxBots: 20 })
+                }),
+                fetch('/api/bot-containers', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: 'TestContainer_2', maxBots: 30 })
+                })
+            ])
+            .then(() => {
+                logMessage(`[SUCCESS] Entorno de prueba creado con 2 contenedores`, 'success');
+                refreshStats();
+            })
+            .catch(error => {
+                logMessage(`[ERROR] Error al crear entorno de prueba: ${error.message}`, 'error');
+            });
+        }
+        
+        function createStressTest() {
+            logMessage(`[ADMIN] Iniciando test de estrés con 50 bots...`);
+            
+            // Crear contenedor de stress test
+            fetch('/api/bot-containers', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'StressTest_Container', maxBots: 50 })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.containerId) {
+                    // Agregar 50 bots al contenedor
+                    return fetch(`/api/bot-containers/${data.containerId}/bots`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ count: 50 })
+                    });
+                }
+            })
+            .then(() => {
+                logMessage(`[SUCCESS] Test de estrés iniciado con 50 bots`, 'success');
+                refreshStats();
+            })
+            .catch(error => {
+                logMessage(`[ERROR] Error al crear test de estrés: ${error.message}`, 'error');
+            });
+        }
+        
+        function createDefaultContainer() {
+            logMessage(`[ADMIN] Creando contenedor por defecto...`);
+            
+            fetch('/api/bot-containers', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: 'DefaultContainer', maxBots: 25 })
+            })
+            .then(response => response.json())
+            .then(data => {
+                logMessage(`[SUCCESS] ${data.message}`, 'success');
+                refreshStats();
+            })
+            .catch(error => {
+                logMessage(`[ERROR] Error al crear contenedor por defecto: ${error.message}`, 'error');
+            });
+        }
     </script>
 </body>
 </html>
@@ -514,3 +709,7 @@ static string GetAdminPanel()
 }
 
 app.Run();
+
+// Request models for API endpoints
+public record CreateContainerRequest(string Name, int MaxBots = 50);
+public record SpawnBotsRequest(int Count);

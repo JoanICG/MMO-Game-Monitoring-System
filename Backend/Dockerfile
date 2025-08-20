@@ -3,11 +3,11 @@ WORKDIR /src
 
 # Copy csproj and restore as distinct layers (better Docker caching)
 COPY ./src/*.csproj ./
-RUN dotnet restore
+RUN dotnet restore --disable-parallel
 
-# Copy everything else and publish directly
+# Copy everything else and publish with fresh restore
 COPY ./src ./
-RUN dotnet publish -c Release -o /out --no-restore
+RUN dotnet publish -c Release -o /out
 
 FROM mcr.microsoft.com/dotnet/aspnet:8.0
 WORKDIR /app

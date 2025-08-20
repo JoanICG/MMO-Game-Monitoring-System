@@ -19,8 +19,7 @@ public class LocalPlayerController : MonoBehaviour
     [Header("Camera Integration")]
     public bool autoSetupCamera = true;
     
-    private NetworkClient _net;
-    private MonoBehaviour _udpNet; // UDP client reference (UdpNetworkClient as MonoBehaviour)
+    private UdpNetworkClient _udpNet; // UDP client reference
     private float _lastInputSendTime;
     
     // Client-Side Prediction
@@ -44,7 +43,7 @@ public class LocalPlayerController : MonoBehaviour
     private object _cameraManager;
 
     // Add method to set network client
-    public void SetNetworkClient(MonoBehaviour udpClient)
+    public void SetNetworkClient(UdpNetworkClient udpClient)
     {
         _udpNet = udpClient;
     }
@@ -84,25 +83,24 @@ public class LocalPlayerController : MonoBehaviour
 
     private void Start()
     {
-        // Try both network clients for backward compatibility
-        _net = NetworkClient.Instance;
-        
-        // Try to find UDP client using component search
-        var udpClientObjs = FindObjectsByType<MonoBehaviour>(FindObjectsSortMode.None);
-        foreach (var obj in udpClientObjs)
+        // Find UDP client - server is now UDP-only
+        _udpNet = UdpNetworkClient.Instance;
+        if (_udpNet == null)
         {
-            if (obj.GetType().Name == "UdpNetworkClient")
-            {
-                _udpNet = obj;
-                break;
-            }
+            _udpNet = FindFirstObjectByType<UdpNetworkClient>();
+        }
+        
+        if (_udpNet == null)
+        {
+            Debug.LogError("[LocalPlayerController] UdpNetworkClient not found! Please add UdpNetworkClient to the scene. WebSocket is no longer supported.");
+            return;
         }
         
         _lastMetricsTime = Time.time;
         
         SetupCameraSystem();
         
-        Debug.Log("[LocalPlayerController] Initialized with UDP and WebSocket support");
+        Debug.Log("[LocalPlayerController] Initialized with UDP-only support");
     }
     
     private void SetupCameraSystem()
@@ -139,7 +137,7 @@ public class LocalPlayerController : MonoBehaviour
 
     private void Update()
     {
-        if (_net == null || _net.localPlayerId == System.Guid.Empty) return;
+        if (_udpNet == null || _udpNet.localPlayerId == System.Guid.Empty) return;
 
         // Gather input
         _currentInput = new Vector2(Input.GetAxisRaw("Horizontal"), Input.GetAxisRaw("Vertical"));
@@ -204,26 +202,21 @@ public class LocalPlayerController : MonoBehaviour
         {
             _inputSequence++;
             
-            // Prefer UDP over WebSocket for better performance
+            // UDP-only communication (WebSocket removed)
             if (_udpNet != null)
             {
-                // Use reflection to call SendPlayerInput on UDP client
-                var method = _udpNet.GetType().GetMethod("SendPlayerInput");
-                if (method != null)
-                {
-                    var task = (Task)method.Invoke(_udpNet, new object[] { _inputSequence, _currentInput, speed });
-                    await task;
-                }
+                await _udpNet.SendPlayerInput(_inputSequence, _currentInput, speed);
             }
-            else if (_net != null)
+            else
             {
-                await _net.SendPlayerInput(_inputSequence, _currentInput, speed);
+                Debug.LogError("[LocalPlayerController] No UDP client available! Server is UDP-only.");
+                return;
             }
             
             _lastSentInput = _currentInput;
             _totalInputsSent++;
             
-            Debug.Log($"[Input] Seq: {_inputSequence}, Input: {_currentInput}, Protocol: {(_udpNet != null ? "UDP" : "WebSocket")}");
+            Debug.Log($"[Input] Seq: {_inputSequence}, Input: {_currentInput}, Protocol: UDP");
         }
     }
 
@@ -233,7 +226,7 @@ public class LocalPlayerController : MonoBehaviour
         if (Time.time - _lastMetricsTime >= 5f)
         {
             var metrics = new {
-                playerId = _net.localPlayerId.ToString(),
+                playerId = _udpNet?.localPlayerId.ToString() ?? "unknown",
                 inputsPerSecond = _totalInputsSent / 5f,
                 position = transform.position,
                 velocity = _velocity.magnitude,
