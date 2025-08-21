@@ -155,10 +155,12 @@ public class UdpGameServer : IDisposable
 
 public class PlayerSession
 {
+    public Guid Id { get; } = Guid.NewGuid();
     public IPEndPoint EndPoint { get; }
     public Guid PlayerId { get; set; }
     public DateTime LastHeartbeat { get; set; }
     public uint LastSequenceReceived { get; set; }
+    public DateTime? LastInputTime { get; set; }
 
     public PlayerSession(IPEndPoint endPoint)
     {

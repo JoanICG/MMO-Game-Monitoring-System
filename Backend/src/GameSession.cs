@@ -1,38 +1,44 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
+using Backend.Interfaces;
+using Backend.Services;
 
 namespace Backend;
 
 public class GameSession : IDisposable
 {
-    private readonly ConcurrentDictionary<Guid, PlayerState> _players = new();
-    private readonly ConcurrentDictionary<Guid, PlayerSession> _playerSessions = new();
-    private readonly JsonSerializerOptions _json = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
-    private readonly object _broadcastLock = new object();
-    private DateTime _lastBroadcast = DateTime.MinValue;
-    private DateTime _lastBotUpdate = DateTime.MinValue;
-    private const int BROADCAST_THROTTLE_MS = 50; // Max 20 broadcasts per second
-    private const int BROADCAST_THROTTLE_HIGH_LOAD_MS = 200; // 5 broadcasts per second when many bots
-    private const int BOT_UPDATE_MS = 100; // Bot AI updates every 100ms
-    private readonly Random _random = new Random();
-    private readonly Timer _gameLoopTimer;
-    private bool _disposed = false;
-    
-    // Integration with new Bot Management System
+    private readonly IPlayerRepository _playerRepository;
+    private readonly IBroadcastService _broadcastService;
+    private readonly IInputHandler _inputHandler;
+    private readonly IGameLoopService _gameLoopService;
     private readonly BotManagementSystem _botManager;
+    private readonly JsonSerializerOptions _json = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+    private bool _disposed = false;
+    private DateTime? _gameLoopStartTime = DateTime.UtcNow;
 
-    public GameSession()
+    public GameSession(
+        IPlayerRepository? playerRepository = null,
+        IBroadcastService? broadcastService = null,
+        IInputHandler? inputHandler = null,
+        IGameLoopService? gameLoopService = null)
     {
+        // Use dependency injection or create default implementations
+        _playerRepository = playerRepository ?? new PlayerRepository();
+        _broadcastService = broadcastService ?? new BroadcastService();
+        _inputHandler = inputHandler ?? new InputHandler();
+        _gameLoopService = gameLoopService ?? new GameLoopService(_playerRepository, _broadcastService);
+
         // Initialize Bot Management System
         _botManager = BotManagementSystem.Instance;
         
-        // Start independent game loop for bot updates
-        _gameLoopTimer = new Timer(GameLoopTick, null, TimeSpan.FromMilliseconds(BOT_UPDATE_MS), TimeSpan.FromMilliseconds(BOT_UPDATE_MS));
-        Console.WriteLine("[GameSession] Game loop timer started (bot updates every 100ms)");
+        // Start game loop
+        _gameLoopService.Start();
+        
+        Console.WriteLine("[GameSession] Initialized with dependency injection pattern");
         Console.WriteLine("[GameSession] Bot Management System integrated");
     }
 
-    // Add UDP message handler
+    // Add UDP message handler - now delegates to services
     public async Task HandleUdpMessage(PlayerSession session, JsonDocument doc, UdpGameServer server)
     {
         if (!doc.RootElement.TryGetProperty("op", out var opProp)) return;
@@ -41,15 +47,15 @@ public class GameSession : IDisposable
         switch (op)
         {
             case "join":
-                await HandleUdpJoin(session, doc, server);
+                await _inputHandler.HandleJoin(session, doc, server, _playerRepository);
                 break;
             case "input":
-                await HandleUdpInput(session, doc, server);
+                await _inputHandler.HandleInput(session, doc, server, _playerRepository);
                 break;
             case "heartbeat":
                 session.LastHeartbeat = DateTime.UtcNow;
                 break;
-            // New Bot Management System commands
+            // Bot Management System admin commands
             case "admin_create_bot_container":
                 await HandleAdminCreateBotContainer(doc, server);
                 break;
@@ -71,7 +77,7 @@ public class GameSession : IDisposable
             case "admin_bot_stats":
                 await HandleAdminBotStats(doc, server);
                 break;
-            // Existing admin commands
+            // Legacy admin commands
             case "admin_spawn_npc":
                 await HandleAdminSpawnNPC(doc, server);
                 break;
@@ -102,191 +108,22 @@ public class GameSession : IDisposable
         }
     }
 
-    private async Task HandleUdpJoin(PlayerSession session, JsonDocument doc, UdpGameServer server)
-    {
-        var name = doc.RootElement.TryGetProperty("name", out var nameProp) ? 
-                   nameProp.GetString() ?? "Player" : "Player";
-        
-        var player = new PlayerState { Name = name[..Math.Min(name.Length, 16)] };
-        session.PlayerId = player.Id;
-        
-        _players[player.Id] = player;
-        _playerSessions[player.Id] = session;
-        
-        Console.WriteLine($"[GameSession] UDP JOIN id={player.Id} name={player.Name} endpoint={session.EndPoint}");
-        
-        // Send join acknowledgment
-        await server.SendToClient(session.EndPoint, new JoinAck("join_ack", player.Id));
-    }
-
-    private async Task HandleUdpInput(PlayerSession session, JsonDocument doc, UdpGameServer server)
-    {
-        if (!_players.TryGetValue(session.PlayerId, out var player)) return;
-
-        // Extract sequence number for duplicate detection
-        var sequence = doc.RootElement.TryGetProperty("seq", out var seqP) ? seqP.GetUInt32() : 0;
-        
-        // Skip if this is an old packet (simple duplicate detection)
-        if (sequence <= session.LastSequenceReceived) return;
-        session.LastSequenceReceived = sequence;
-
-        // Extract input data
-        var inputX = doc.RootElement.TryGetProperty("x", out var ixP) ? ixP.GetSingle() : 0f;
-        var inputY = doc.RootElement.TryGetProperty("y", out var iyP) ? iyP.GetSingle() : 0f;
-        var speed = doc.RootElement.TryGetProperty("speed", out var speedP) ? speedP.GetSingle() : 5f;
-
-        // Server authority check
-        if (player.ServerAuthorityUntil.HasValue && DateTime.UtcNow < player.ServerAuthorityUntil.Value)
-        {
-            Console.WriteLine($"[GameSession] UDP INPUT IGNORED (SERVER AUTHORITY) id={player.Id}");
-            return;
-        }
-
-        // Apply server-side movement
-        var deltaTime = 0.05f; // 20Hz server tick
-        var inputMagnitude = Math.Sqrt(inputX * inputX + inputY * inputY);
-        if (inputMagnitude > 1f)
-        {
-            inputX /= (float)inputMagnitude;
-            inputY /= (float)inputMagnitude;
-        }
-
-        var deltaX = inputX * speed * deltaTime;
-        var deltaZ = inputY * speed * deltaTime;
-
-        player.X += deltaX;
-        player.Z += deltaZ;
-        player.LastUpdate = DateTime.UtcNow;
-
-        Console.WriteLine($"[GameSession] UDP INPUT seq={sequence} id={player.Id} pos=({player.X:F2},{player.Y:F2},{player.Z:F2})");
-    }
-
+    // Delegate broadcast to service
     public async Task BroadcastStateUdp(UdpGameServer server)
     {
-        // Get total entity count first for dynamic throttling
-        var managedBots = _botManager.GetAllActiveBots();
-        var totalEntities = _players.Count + managedBots.Count;
-        
-        // Dynamic throttling based on entity count
-        var throttleMs = totalEntities switch
-        {
-            > 150 => 200, // 5 FPS for 150+ entities
-            > 100 => 100, // 10 FPS for 100+ entities  
-            > 50 => 75,   // ~13 FPS for 50+ entities
-            _ => BROADCAST_THROTTLE_MS // 20 FPS for <50 entities
-        };
-        
-        lock (_broadcastLock)
-        {
-            var now = DateTime.UtcNow;
-            if ((now - _lastBroadcast).TotalMilliseconds < throttleMs)
-            {
-                return;
-            }
-            _lastBroadcast = now;
-        }
-
-        UpdateBots();
-
-        // Combine regular players with managed bots
-        var playerDtos = new List<PlayerDto>();
-        
-        // Add regular players
-        playerDtos.AddRange(_players.Values.Select(p => new PlayerDto(
-            p.Id, p.Name, p.X, p.Y, p.Z, p.IsNPC)));
-        
-        // Add managed bots from Bot Management System
-        // var managedBots = _botManager.GetAllActiveBots(); // Already retrieved above
-        // Only log occasionally to reduce spam
-        if (DateTime.UtcNow.Second % 10 == 0 && DateTime.UtcNow.Millisecond < 100)
-        {
-            Console.WriteLine($"[DEBUG] Broadcasting state: {_players.Count} players, {managedBots.Count} managed bots");
-        }
-        playerDtos.AddRange(managedBots.Select(bot => new PlayerDto(
-            bot.Id, bot.Name, bot.X, bot.Y, bot.Z, true)));
-
-        var snap = new StateSnapshot("state", playerDtos, GetBenchmarkMetrics());
-        await server.BroadcastToAll(snap);
+        await _broadcastService.BroadcastState(server, _playerRepository, _botManager);
     }
 
-    private void GameLoopTick(object? state)
+    // Dispose method - now delegates to services
+    public void Dispose()
     {
         if (_disposed) return;
         
-        try 
-        {
-            var botsToUpdate = _players.Values.Where(p => p.IsBot && p.BotBehavior != BotBehavior.Idle).ToList();
-            if (botsToUpdate.Count > 0)
-            {
-                // Performance optimization: limit concurrent bot updates for large counts
-                const int MAX_BOTS_PER_UPDATE = 200;
-                var botsThisUpdate = botsToUpdate.Count > MAX_BOTS_PER_UPDATE ? 
-                    botsToUpdate.Take(MAX_BOTS_PER_UPDATE).ToList() : 
-                    botsToUpdate;
-                
-                bool anyBotMoved = false;
-                int updatedCount = 0;
-                
-                foreach (var botState in botsThisUpdate)
-                {
-                    var oldX = botState.X;
-                    var oldZ = botState.Z;
-                    
-                    try
-                    {
-                        UpdateBotBehavior(botState);
-                        updatedCount++;
-                        
-                        // Check if bot actually moved (reduced logging for performance)
-                        if (Math.Abs(oldX - botState.X) > 0.001f || Math.Abs(oldZ - botState.Z) > 0.001f)
-                        {
-                            anyBotMoved = true;
-                            // Only log movement for debugging with smaller bot counts
-                            if (botsToUpdate.Count <= 50)
-                            {
-                                Console.WriteLine($"[GameSession] BOT MOVED id={botState.Id} from=({oldX:F2},{oldZ:F2}) to=({botState.X:F2},{botState.Z:F2}) behavior={botState.BotBehavior}");
-                            }
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"[GameSession] Bot update error for {botState.Id}: {ex.Message}");
-                        // Set bot to idle to prevent repeated errors
-                        botState.BotBehavior = BotBehavior.Idle;
-                    }
-                }
-                
-                // Broadcast state if any bot moved
-                if (anyBotMoved)
-                {
-                    // Throttle broadcasts more aggressively with many bots
-                    var broadcastThrottle = botsToUpdate.Count > 100 ? 200 : BROADCAST_THROTTLE_MS;
-                    
-                    if ((DateTime.UtcNow - _lastBroadcast).TotalMilliseconds >= broadcastThrottle)
-                    {
-                        _ = Task.Run(async () => await BroadcastStateUdp(null!)); // Will be set properly in UDP context
-                    }
-                }
-                
-                // Log performance info for large bot counts
-                if (botsToUpdate.Count > 100)
-                {
-                    Console.WriteLine($"[GameSession] Bot Update: {updatedCount}/{botsToUpdate.Count} bots processed (limited for performance)");
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[GameSession] Game loop error: {ex.Message}");
-        }
-    }
-
-    public void Dispose()
-    {
         _disposed = true;
-        _gameLoopTimer?.Dispose();
+        _gameLoopService?.Dispose();
         _botManager?.Dispose();
-        Console.WriteLine("[GameSession] Game loop timer and bot management disposed");
+        
+        Console.WriteLine("[GameSession] Services disposed");
     }
 
     // ============================================
@@ -523,115 +360,7 @@ public class GameSession : IDisposable
         });
     }
 
-    private void UpdateBots()
-    {
-        var now = DateTime.UtcNow;
-        if ((now - _lastBotUpdate).TotalMilliseconds < BOT_UPDATE_MS)
-            return;
-
-        _lastBotUpdate = now;
-
-        foreach (var state in _players.Values)
-        {
-            if (!state.IsBot || state.BotBehavior == BotBehavior.Idle)
-                continue;
-
-            UpdateBotBehavior(state);
-        }
-    }
-
-    private void UpdateBotBehavior(PlayerState bot)
-    {
-        var deltaTime = 0.1f; // 100ms update rate
-        
-        switch (bot.BotBehavior)
-        {
-            case BotBehavior.Random:
-                UpdateBotRandom(bot, deltaTime);
-                break;
-            case BotBehavior.Follow:
-                UpdateBotFollow(bot, deltaTime);
-                break;
-            case BotBehavior.Patrol:
-                UpdateBotPatrol(bot, deltaTime);
-                break;
-        }
-        
-        bot.LastUpdate = DateTime.UtcNow;
-    }
-
-    private void UpdateBotRandom(PlayerState bot, float deltaTime)
-    {
-        // Change direction every 2 seconds, but move continuously
-        if ((DateTime.UtcNow - bot.LastBotUpdate).TotalSeconds > 2)
-        {
-            // Generate new random direction
-            bot.BotMoveDirection = new Vector3(
-                (_random.NextSingle() - 0.5f) * 2f,
-                0,
-                (_random.NextSingle() - 0.5f) * 2f
-            ).Normalized();
-            bot.LastBotUpdate = DateTime.UtcNow;
-            Console.WriteLine($"[GameSession] BOT RANDOM new direction id={bot.Id} dir=({bot.BotMoveDirection.Value.X:F2},{bot.BotMoveDirection.Value.Z:F2})");
-        }
-        
-        // Apply continuous movement
-        if (bot.BotMoveDirection.HasValue)
-        {
-            bot.X += bot.BotMoveDirection.Value.X * bot.BotSpeed * deltaTime;
-            bot.Z += bot.BotMoveDirection.Value.Z * bot.BotSpeed * deltaTime;
-        }
-    }
-
-    private void UpdateBotFollow(PlayerState bot, float deltaTime)
-    {
-        if (bot.FollowTargetId == null) return;
-        
-        if (_players.TryGetValue(bot.FollowTargetId.Value, out var targetBot))
-        {
-            var targetPos = new Vector3(targetBot.X, targetBot.Y, targetBot.Z);
-            var botPos = new Vector3(bot.X, bot.Y, bot.Z);
-            
-            var distance = botPos.Distance(targetPos);
-            if (distance > 2f) // Follow if more than 2 units away
-            {
-                var direction = new Vector3(
-                    targetPos.X - botPos.X,
-                    0,
-                    targetPos.Z - botPos.Z
-                ).Normalized();
-                
-                bot.X += direction.X * bot.BotSpeed * deltaTime;
-                bot.Z += direction.Z * bot.BotSpeed * deltaTime;
-            }
-        }
-    }
-
-    private void UpdateBotPatrol(PlayerState bot, float deltaTime)
-    {
-        if (bot.PatrolWaypoints.Count == 0) return;
-        
-        var currentTarget = bot.PatrolWaypoints[bot.CurrentWaypointIndex];
-        var botPos = new Vector3(bot.X, bot.Y, bot.Z);
-        
-        var distance = botPos.Distance(currentTarget);
-        if (distance < 0.5f) // Reached waypoint
-        {
-            bot.CurrentWaypointIndex = (bot.CurrentWaypointIndex + 1) % bot.PatrolWaypoints.Count;
-            currentTarget = bot.PatrolWaypoints[bot.CurrentWaypointIndex];
-        }
-        
-        var direction = new Vector3(
-            currentTarget.X - botPos.X,
-            0,
-            currentTarget.Z - botPos.Z
-        ).Normalized();
-        
-        bot.X += direction.X * bot.BotSpeed * deltaTime;
-        bot.Z += direction.Z * bot.BotSpeed * deltaTime;
-    }
-
-    // Admin commands now work through UDP (no WebSocket admin needed)
+    // Legacy admin commands - simplified by using repository
     public async Task HandleAdminSpawnNPC(JsonDocument doc, UdpGameServer server)
     {
         var name = doc.RootElement.TryGetProperty("name", out var nameProp) ? nameProp.GetString() ?? "NPC" : "NPC";
@@ -648,7 +377,7 @@ public class GameSession : IDisposable
             IsNPC = true 
         };
         
-        _players[npc.Id] = npc;
+        _playerRepository.AddPlayer(npc);
         Console.WriteLine($"[GameSession] ADMIN SPAWN NPC id={npc.Id} name={npc.Name} pos=({x},{y},{z})");
         await BroadcastStateUdp(server);
     }
@@ -662,7 +391,8 @@ public class GameSession : IDisposable
         var y = doc.RootElement.TryGetProperty("y", out var yProp) ? yProp.GetSingle() : 0f;
         var z = doc.RootElement.TryGetProperty("z", out var zProp) ? zProp.GetSingle() : 0f;
 
-        if (_players.TryGetValue(playerId, out var player))
+        var player = _playerRepository.GetPlayer(playerId);
+        if (player != null)
         {
             player.X = x;
             player.Y = y;
@@ -679,10 +409,8 @@ public class GameSession : IDisposable
         var playerIdStr = doc.RootElement.TryGetProperty("playerId", out var playerIdProp) ? playerIdProp.GetString() : null;
         if (playerIdStr == null || !Guid.TryParse(playerIdStr, out var playerId)) return;
 
-        if (_players.TryRemove(playerId, out var player))
+        if (_playerRepository.RemovePlayer(playerId))
         {
-            // Remove from session tracking
-            _playerSessions.TryRemove(playerId, out _);
             Console.WriteLine($"[GameSession] ADMIN KICK player={playerId}");
             await BroadcastStateUdp(server);
         }
@@ -694,7 +422,8 @@ public class GameSession : IDisposable
         var y = doc.RootElement.TryGetProperty("y", out var yProp) ? yProp.GetSingle() : 0f;
         var z = doc.RootElement.TryGetProperty("z", out var zProp) ? zProp.GetSingle() : 0f;
 
-        foreach (var state in _players.Values)
+        var players = _playerRepository.GetAllPlayers();
+        foreach (var state in players)
         {
             if (!state.IsAdmin) // Don't teleport admins
             {
@@ -711,16 +440,12 @@ public class GameSession : IDisposable
 
     public async Task HandleAdminKickAll(UdpGameServer server)
     {
-        var toKick = _players.Values.Where(p => !p.IsAdmin).ToList();
-        foreach (var state in toKick)
-        {
-            _players.TryRemove(state.Id, out _);
-            _playerSessions.TryRemove(state.Id, out _);
-        }
-        Console.WriteLine($"[GameSession] ADMIN KICK ALL ({toKick.Count} players)");
+        var kickedCount = _playerRepository.RemoveAllNonAdminPlayers();
+        Console.WriteLine($"[GameSession] ADMIN KICK ALL ({kickedCount} players)");
         await BroadcastStateUdp(server);
     }
 
+    // Legacy bot commands - simplified using repository
     public async Task HandleAdminSpawnBot(JsonDocument doc, UdpGameServer server)
     {
         var name = doc.RootElement.TryGetProperty("name", out var nameProp) ? nameProp.GetString() ?? "Bot" : "Bot";
@@ -739,7 +464,7 @@ public class GameSession : IDisposable
             BotBehavior = ParseBotBehavior(behavior)
         };
         
-        _players[bot.Id] = bot;
+        _playerRepository.AddPlayer(bot);
         Console.WriteLine($"[GameSession] ADMIN SPAWN BOT id={bot.Id} name={bot.Name} pos=({x},{y},{z}) behavior={behavior}");
         await BroadcastStateUdp(server);
     }
@@ -753,7 +478,8 @@ public class GameSession : IDisposable
         var y = doc.RootElement.TryGetProperty("y", out var yProp) ? yProp.GetSingle() : 0f;
         var z = doc.RootElement.TryGetProperty("z", out var zProp) ? zProp.GetSingle() : 0f;
 
-        if (_players.TryGetValue(botId, out var player) && player.IsBot)
+        var player = _playerRepository.GetPlayer(botId);
+        if (player != null && player.IsBot)
         {
             player.X = x;
             player.Y = y;
@@ -772,7 +498,8 @@ public class GameSession : IDisposable
         var behavior = doc.RootElement.TryGetProperty("behavior", out var behaviorProp) ? behaviorProp.GetString() ?? "idle" : "idle";
         var targetIdStr = doc.RootElement.TryGetProperty("targetId", out var targetIdProp) ? targetIdProp.GetString() : null;
 
-        if (_players.TryGetValue(botId, out var player) && player.IsBot)
+        var player = _playerRepository.GetPlayer(botId);
+        if (player != null && player.IsBot)
         {
             player.BotBehavior = ParseBotBehavior(behavior);
             
@@ -812,6 +539,7 @@ public class GameSession : IDisposable
         };
     }
 
+    // Benchmark methods - simplified using repository
     public async Task HandleAdminSpawnBenchmarkBots(JsonDocument doc, UdpGameServer server)
     {
         var count = doc.RootElement.TryGetProperty("count", out var countProp) ? countProp.GetInt32() : 100;
@@ -823,10 +551,6 @@ public class GameSession : IDisposable
         Console.WriteLine($"[GameSession] ADMIN SPAWN BENCHMARK BOTS count={count} behavior={behavior} spread={spreadRadius}");
         await SpawnBenchmarkBots(count, behavior, spreadRadius, server);
     }
-
-    // ============================================
-    // BENCHMARK & STRESS TESTING FUNCTIONS
-    // ============================================
 
     /// <summary>
     /// Spawn multiple bots for server performance testing
@@ -843,7 +567,7 @@ public class GameSession : IDisposable
             count = MAX_BOTS;
         }
         
-        var currentEntities = _players.Count;
+        var currentEntities = _playerRepository.GetPlayerCount();
         if (currentEntities + count > CRITICAL_ENTITY_COUNT)
         {
             var safeCount = Math.Max(0, CRITICAL_ENTITY_COUNT - currentEntities);
@@ -862,6 +586,7 @@ public class GameSession : IDisposable
         
         var spawnedIds = new List<Guid>();
         var batchSize = Math.Min(5, count / 10); // Smaller batches for large counts
+        var random = new Random();
         
         for (int i = 0; i < count; i += batchSize)
         {
@@ -872,8 +597,8 @@ public class GameSession : IDisposable
                 var botId = Guid.NewGuid();
                 
                 // Random position within spread radius
-                var angle = _random.NextDouble() * Math.PI * 2;
-                var distance = _random.NextDouble() * spreadRadius;
+                var angle = random.NextDouble() * Math.PI * 2;
+                var distance = random.NextDouble() * spreadRadius;
                 var x = (float)(Math.Cos(angle) * distance);
                 var z = (float)(Math.Sin(angle) * distance);
                 
@@ -887,7 +612,7 @@ public class GameSession : IDisposable
                     IsBot = true,
                     BotBehavior = behavior,
                     BotMoveDirection = new Vector3(0, 0, 0),
-                    BotSpeed = _random.Next(2, 6), // Random speed 2-5
+                    BotSpeed = random.Next(2, 6), // Random speed 2-5
                     LastUpdate = DateTime.UtcNow
                 };
                 
@@ -895,9 +620,9 @@ public class GameSession : IDisposable
                 if (behavior == BotBehavior.Random)
                 {
                     botState.BotMoveDirection = new Vector3(
-                        (float)(_random.NextDouble() - 0.5) * 2,
+                        (float)(random.NextDouble() - 0.5) * 2,
                         0,
-                        (float)(_random.NextDouble() - 0.5) * 2
+                        (float)(random.NextDouble() - 0.5) * 2
                     );
                 }
                 else if (behavior == BotBehavior.Patrol)
@@ -913,7 +638,7 @@ public class GameSession : IDisposable
                     botState.CurrentWaypointIndex = 0;
                 }
                 
-                _players.TryAdd(botId, botState);
+                _playerRepository.AddPlayer(botState);
                 spawnedIds.Add(botId);
             }
             
@@ -927,16 +652,16 @@ public class GameSession : IDisposable
         
         var duration = DateTime.UtcNow - startTime;
         Console.WriteLine($"[BENCHMARK] Spawned {spawnedIds.Count} bots in {duration.TotalMilliseconds:F2}ms");
-        Console.WriteLine($"[BENCHMARK] Total entities: {_players.Count} (Active bots: {_players.Values.Count(p => p.IsBot && p.BotBehavior != BotBehavior.Idle)})");
+        Console.WriteLine($"[BENCHMARK] Total entities: {_playerRepository.GetPlayerCount()} (Active bots: {_playerRepository.GetActiveBotCount()})");
         
         // Only broadcast if entity count is reasonable and server is available
-        if (_players.Count <= CRITICAL_ENTITY_COUNT && server != null)
+        if (_playerRepository.GetPlayerCount() <= CRITICAL_ENTITY_COUNT && server != null)
         {
             await BroadcastStateUdp(server);
         }
         else
         {
-            Console.WriteLine($"[BENCHMARK] WARNING: Skipping broadcast - too many entities ({_players.Count}) or no server");
+            Console.WriteLine($"[BENCHMARK] WARNING: Skipping broadcast - too many entities ({_playerRepository.GetPlayerCount()}) or no server");
         }
         
         // Log performance metrics
@@ -949,20 +674,11 @@ public class GameSession : IDisposable
     public async Task ClearBenchmarkBots(UdpGameServer? server = null)
     {
         var startTime = DateTime.UtcNow;
-        var botIds = _players.Where(p => p.Value.IsBot && p.Value.Name.StartsWith("BenchBot_"))
-                            .Select(p => p.Key)
-                            .ToList();
-        
-        Console.WriteLine($"[BENCHMARK] Removing {botIds.Count} benchmark bots...");
-        
-        foreach (var botId in botIds)
-        {
-            _players.TryRemove(botId, out _);
-        }
+        var botCount = _playerRepository.RemoveBenchmarkBots();
         
         var duration = DateTime.UtcNow - startTime;
-        Console.WriteLine($"[BENCHMARK] Removed {botIds.Count} bots in {duration.TotalMilliseconds:F2}ms");
-        Console.WriteLine($"[BENCHMARK] Remaining entities: {_players.Count}");
+        Console.WriteLine($"[BENCHMARK] Removed {botCount} bots in {duration.TotalMilliseconds:F2}ms");
+        Console.WriteLine($"[BENCHMARK] Remaining entities: {_playerRepository.GetPlayerCount()}");
         
         if (server != null)
         {
@@ -975,10 +691,10 @@ public class GameSession : IDisposable
     /// </summary>
     public ServerBenchmarkMetrics GetBenchmarkMetrics()
     {
-        var totalPlayers = _players.Count;
-        var realPlayers = _players.Count(p => !p.Value.IsBot);
-        var totalBots = _players.Count(p => p.Value.IsBot);
-        var activeBots = _players.Count(p => p.Value.IsBot && p.Value.BotBehavior != BotBehavior.Idle);
+        var totalPlayers = _playerRepository.GetPlayerCount();
+        var realPlayers = _playerRepository.GetRealPlayerCount();
+        var totalBots = _playerRepository.GetBotCount();
+        var activeBots = _playerRepository.GetActiveBotCount();
         
         return new ServerBenchmarkMetrics
         {
@@ -986,13 +702,11 @@ public class GameSession : IDisposable
             RealPlayers = realPlayers,
             TotalBots = totalBots,
             ActiveBots = activeBots,
-            UpdatesPerSecond = 1000 / BOT_UPDATE_MS, // Theoretical max
+            UpdatesPerSecond = _gameLoopService.IsRunning ? 10 : 0, // 10 Hz game loop
             MemoryUsageMB = GC.GetTotalMemory(false) / 1024 / 1024,
             UptimeSeconds = (DateTime.UtcNow - (_gameLoopStartTime ?? DateTime.UtcNow)).TotalSeconds
         };
     }
-
-    private DateTime? _gameLoopStartTime = DateTime.UtcNow;
 
     private void LogBenchmarkMetrics(int newBots)
     {

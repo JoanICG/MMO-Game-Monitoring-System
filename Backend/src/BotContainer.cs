@@ -39,7 +39,7 @@ namespace Backend
             Console.WriteLine($"[BotContainer] Created container '{name}' with max {maxBots} bots");
         }
         
-        public bool AddBot(string botName = null)
+        public bool AddBot(string? botName = null)
         {
             lock (_lockObject)
             {
