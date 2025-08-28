@@ -174,7 +174,7 @@ public class UdpNetworkClient : MonoBehaviour
         }
     }
 
-    public async Task SendPlayerInput(uint sequence, Vector2 input, float speed)
+    public async Task SendPlayerInput(uint sequence, Vector2 input, float speed, Vector3 position)
     {
         if (!_connected) return;
 
@@ -182,8 +182,9 @@ public class UdpNetworkClient : MonoBehaviour
         {
             op = "input",
             seq = sequence,
-            x = input.x,
-            y = input.y,
+            x = position.x,
+            y = position.y,
+            z = position.z,
             speed = speed,
             time = Time.time
         };
@@ -231,9 +232,9 @@ public class UdpNetworkClient : MonoBehaviour
     {
         try
         {
-            if (json.Contains("\"op\":\"join_ack\""))
+            if (json.Contains("\"op\":\"joined\""))
             {
-                var startIndex = json.IndexOf("\"id\":\"") + 6;
+                var startIndex = json.IndexOf("\"playerId\":\"") + 12;
                 var endIndex = json.IndexOf("\"", startIndex);
                 var idStr = json.Substring(startIndex, endIndex - startIndex);
                 

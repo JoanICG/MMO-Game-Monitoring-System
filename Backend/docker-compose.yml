@@ -1,8 +1,0 @@
-services:
-  backend:
-    build: .
-    container_name: mmo-backend
-    ports:
-      - "8080:8080"  # WebSocket (admin and legacy clients)
-      - "8081:8081/udp"  # UDP (game clients)
-    restart: unless-stopped

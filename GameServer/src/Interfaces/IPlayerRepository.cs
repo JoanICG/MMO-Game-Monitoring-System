@@ -1,37 +1,30 @@
 using System.Collections.Concurrent;
 
-namespace Backend.Interfaces
+namespace GameServer.Interfaces
 {
     public interface IPlayerRepository
     {
-        void AddPlayer(PlayerState player);
+        void AddPlayer(Shared.Models.PlayerState player);
         bool RemovePlayer(Guid playerId);
-        PlayerState? GetPlayer(Guid playerId);
-        IReadOnlyCollection<PlayerState> GetAllPlayers();
+        Shared.Models.PlayerState? GetPlayer(Guid playerId);
+        IReadOnlyCollection<Shared.Models.PlayerState> GetAllPlayers();
         int GetPlayerCount();
         int GetRealPlayerCount();
         int GetBotCount();
         int GetActiveBotCount();
         int RemoveAllNonAdminPlayers();
         int RemoveBenchmarkBots();
-        void AddPlayerSession(Guid playerId, PlayerSession session);
+        void AddPlayerSession(Guid playerId, Shared.Models.PlayerSession session);
         bool RemovePlayerSession(Guid playerId);
-        PlayerSession? GetPlayerSession(Guid playerId);
-        
-        // Legacy compatibility
-        void AddPlayer(Guid id, PlayerState player);
-        void RemovePlayerLegacy(Guid id);
-        IEnumerable<PlayerState> GetAllPlayersLegacy();
-        bool UpdatePlayer(Guid id, Action<PlayerState> updateAction);
-        int PlayerCount { get; }
+        Shared.Models.PlayerSession? GetPlayerSession(Guid playerId);
     }
 
     public class PlayerRepository : IPlayerRepository
     {
-        private readonly ConcurrentDictionary<Guid, PlayerState> _players = new();
-        private readonly ConcurrentDictionary<Guid, PlayerSession> _playerSessions = new();
+        private readonly ConcurrentDictionary<Guid, Shared.Models.PlayerState> _players = new();
+        private readonly ConcurrentDictionary<Guid, Shared.Models.PlayerSession> _playerSessions = new();
 
-        public void AddPlayer(PlayerState player)
+        public void AddPlayer(Shared.Models.PlayerState player)
         {
             _players[player.Id] = player;
         }
@@ -46,12 +39,12 @@ namespace Backend.Interfaces
             return removed;
         }
 
-        public PlayerState? GetPlayer(Guid playerId)
+        public Shared.Models.PlayerState? GetPlayer(Guid playerId)
         {
             return _players.TryGetValue(playerId, out var player) ? player : null;
         }
 
-        public IReadOnlyCollection<PlayerState> GetAllPlayers()
+        public IReadOnlyCollection<Shared.Models.PlayerState> GetAllPlayers()
         {
             return _players.Values.ToList().AsReadOnly();
         }
@@ -73,7 +66,7 @@ namespace Backend.Interfaces
 
         public int GetActiveBotCount()
         {
-            return _players.Values.Count(p => p.IsBot && p.BotBehavior != BotBehavior.Idle);
+            return _players.Values.Count(p => p.IsBot && p.BotBehavior != Shared.Models.BotBehavior.Idle);
         }
 
         public int RemoveAllNonAdminPlayers()
@@ -101,7 +94,7 @@ namespace Backend.Interfaces
             return botIds.Count;
         }
 
-        public void AddPlayerSession(Guid playerId, PlayerSession session)
+        public void AddPlayerSession(Guid playerId, Shared.Models.PlayerSession session)
         {
             _playerSessions[playerId] = session;
         }
@@ -111,52 +104,9 @@ namespace Backend.Interfaces
             return _playerSessions.TryRemove(playerId, out _);
         }
 
-        public PlayerSession? GetPlayerSession(Guid playerId)
+        public Shared.Models.PlayerSession? GetPlayerSession(Guid playerId)
         {
             return _playerSessions.TryGetValue(playerId, out var session) ? session : null;
         }
-
-        // Legacy compatibility methods
-        public void AddPlayer(Guid id, PlayerState player)
-        {
-            // Can't modify Id after creation, so create new player with correct Id
-            var newPlayer = new PlayerState
-            {
-                Id = id,
-                Name = player.Name,
-                X = player.X,
-                Y = player.Y,
-                Z = player.Z,
-                IsBot = player.IsBot,
-                IsNPC = player.IsNPC,
-                IsAdmin = player.IsAdmin,
-                BotBehavior = player.BotBehavior,
-                BotSpeed = player.BotSpeed,
-                LastUpdate = player.LastUpdate
-            };
-            AddPlayer(newPlayer);
-        }
-
-        public void RemovePlayerLegacy(Guid id)
-        {
-            RemovePlayer(id);
-        }
-
-        public IEnumerable<PlayerState> GetAllPlayersLegacy()
-        {
-            return _players.Values.ToList();
-        }
-
-        public bool UpdatePlayer(Guid id, Action<PlayerState> updateAction)
-        {
-            if (_players.TryGetValue(id, out var player))
-            {
-                updateAction(player);
-                return true;
-            }
-            return false;
-        }
-
-        public int PlayerCount => _players.Count;
     }
 }

@@ -1,7 +1,5 @@
 # --- Ignorar TODO Unity salvo Assets/Scripts ---
 UnityClient/*
-!UnityClient/Assets/
-UnityClient/Assets/*
 !UnityClient/Assets/Scripts/
 !UnityClient/Assets/Scripts/**
 # Incluir meta de scripts (ya cubierto con **/*.meta si existen)
@@ -17,11 +15,13 @@ UnityClient/Assets/*
 [Dd]esktop.ini
 [Tt]humbs.db
 
-# Backend C#
+# Backend C# - New separated architecture
 GameServer/bin/
 GameServer/obj/
-Backend/bin/
-Backend/obj/
+BotServer/bin/
+BotServer/obj/
+Shared/bin/
+Shared/obj/
 
 # Node
 **/node_modules/

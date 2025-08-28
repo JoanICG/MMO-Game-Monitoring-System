@@ -1,0 +1,59 @@
+services:
+  game-server:
+    build: 
+      context: .
+      dockerfile: ./GameServer/Dockerfile
+    container_name: mmo-game-server
+    ports:
+      - "8080:8080"    # HTTP API
+      - "8081:8081/udp" # UDP Game Protocol
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - ASPNETCORE_URLS=http://+:8080
+    depends_on:
+      - bot-server
+    networks:
+      - mmo-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  bot-server:
+    build: 
+      context: .
+      dockerfile: ./BotServer/Dockerfile
+    container_name: mmo-bot-server
+    ports:
+      - "8082:8082"    # HTTP API for bot management
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - ASPNETCORE_URLS=http://+:8082
+    networks:
+      - mmo-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8082/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Optional: Redis for shared state (future enhancement)
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: mmo-redis
+  #   ports:
+  #     - "6379:6379"
+  #   networks:
+  #     - mmo-network
+  #   restart: unless-stopped
+
+networks:
+  mmo-network:
+    driver: bridge
+
+volumes:
+  redis-data:
+    driver: local
